@@ -113,6 +113,7 @@ create policy classifications_update on public.classifications for update to aut
 
 -- RLS y permisos de columna evitan cambiar identidades, marcas o fechas.
 revoke all on public.workshops, public.participants, public.areas, public.ideas, public.classifications from public, anon, authenticated;
+revoke all on ceidef_private.moderators from public, anon, authenticated;
 grant select on public.workshops, public.participants, public.areas, public.ideas, public.classifications to authenticated;
 grant insert (author_id, content, organizer), update (content), delete on public.ideas to authenticated;
 grant insert (user_id, idea_id, area_id), update (area_id) on public.classifications to authenticated;
@@ -168,6 +169,14 @@ end;
 $$;
 create trigger guard_classification before insert or update on public.classifications
   for each row execute function ceidef_private.guard_classification();
+
+-- Invoker: el upsert conserva RLS, permisos y triggers, también entre pestañas.
+create function public.classify_idea(target_idea uuid, selected_area smallint) returns void
+language sql security invoker set search_path = '' as $$
+  insert into public.classifications(user_id, idea_id, area_id)
+    values (auth.uid(), target_idea, selected_area)
+    on conflict (user_id, idea_id) do update set area_id = excluded.area_id;
+$$;
 
 create function public.join_workshop(participant_name text) returns public.participants
 language plpgsql security definer set search_path = '' as $$
@@ -228,8 +237,8 @@ end;
 $$;
 
 -- Revocar el EXECUTE que Postgres otorga por defecto a PUBLIC.
-revoke all on function public.is_moderator(), public.join_workshop(text), public.advance_phase(text), public.get_progress(), public.get_results() from public, anon, authenticated;
-grant execute on function public.is_moderator(), public.join_workshop(text), public.advance_phase(text), public.get_progress(), public.get_results() to authenticated;
+revoke all on function public.is_moderator(), public.join_workshop(text), public.advance_phase(text), public.get_progress(), public.get_results(), public.classify_idea(uuid, smallint) from public, anon, authenticated;
+grant execute on function public.is_moderator(), public.join_workshop(text), public.advance_phase(text), public.get_progress(), public.get_results(), public.classify_idea(uuid, smallint) to authenticated;
 revoke all on all functions in schema ceidef_private from public, anon, authenticated;
 -- Los helpers usados por las políticas requieren USAGE/EXECUTE; el esquema no
 -- debe incluirse en los esquemas expuestos de la API de Supabase.

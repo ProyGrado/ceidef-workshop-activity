@@ -49,6 +49,10 @@ export function downloadCsv(snapshot: Snapshot, withResults: boolean) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 export function errorMessage(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error) {
+    if (error.code === 'PGRST116') return 'La fase cambió o el dato ya no está disponible. Actualizá y volvé a intentar.'
+    if (error.code === '42501') return 'No se pudo guardar: la fase está cerrada o tu sesión no tiene permiso para esta operación.'
+  }
   if (error && typeof error === 'object' && 'message' in error) return String(error.message)
   return 'No pudimos completar la operación. Revisá tu conexión y volvé a intentar.'
 }

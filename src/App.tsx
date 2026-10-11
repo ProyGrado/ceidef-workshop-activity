@@ -1,122 +1,216 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
+import { useEffect, useState } from 'react'
+import type { ButtonHTMLAttributes, FormEvent, ReactNode } from 'react'
+import type { Session } from '@supabase/supabase-js'
+import { configurationError, moderationClient, supabase } from './lib/supabase'
+import { useWorkshop } from './hooks/useWorkshop'
+import { AREAS, PHASE_NAMES, PHASES, downloadCsv, errorMessage } from './lib/workshop'
+import type { Idea, Phase, Snapshot } from './lib/workshop'
 import './App.css'
 
+const descriptions: Record<Phase, string> = {
+  waiting: 'Un espacio para pensar juntos el futuro de la farmacoterapia.',
+  ideas: '¿Qué oportunidades o desafíos identificás en la práctica farmacoterapéutica?',
+  classification: 'Leé cada idea y elegí el área con la que más se relaciona.',
+  results: 'Distintas miradas, un mapa compartido. Así clasificamos nuestras ideas.',
+}
+const headings: Record<Phase, string> = {
+  waiting: 'Todo empieza con una idea.', ideas: 'Tu mirada suma.',
+  classification: 'Conectemos las ideas.', results: 'Lo que construimos juntos.',
+}
+const nextLabels: Partial<Record<Phase, string>> = {
+  waiting: 'Comenzar escritura', ideas: 'Cerrar escritura', classification: 'Mostrar resultados',
+}
+
+function Icon({ kind, ...props }: { kind: 'arrow' | 'plus' | 'check' | 'download' | 'lock'; className?: string }) {
+  const paths = { arrow: 'M4 12h16m-6-6 6 6-6 6', plus: 'M12 5v14M5 12h14', check: 'm5 12 4 4L19 6', download: 'M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4', lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z' }
+  return <svg {...props} viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[kind]} /></svg>
+}
+
+function Button({ children, busy, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { busy?: boolean; children: ReactNode }) {
+  return <button {...props} disabled={props.disabled || busy}>{busy ? <span className="spinner" aria-hidden="true" /> : null}{children}</button>
+}
+
+function Note({ idea, editable, onSave, onDelete, busy, children }: {
+  idea: Idea; editable: boolean; onSave: (text: string) => Promise<boolean>;
+  onDelete: () => Promise<boolean>; busy: boolean; children?: ReactNode;
+}) {
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState(idea.content)
+  const [deleting, setDeleting] = useState(false)
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (await onSave(text.trim())) setEditing(false)
+  }
+  return <article className={`note ${idea.organizer ? 'note-team' : ''}`}>
+    <div className="note-top"><span className="note-dot" /><span>{idea.organizer ? 'Equipo organizador' : 'Idea participante'}</span></div>
+    {editing && editable ? <form onSubmit={submit}>
+      <label className="sr-only" htmlFor={`edit-${idea.id}`}>Editar idea</label>
+      <textarea id={`edit-${idea.id}`} value={text} onChange={e => setText(e.target.value)} maxLength={500} required autoFocus disabled={busy} />
+      <small>{text.length}/500</small>
+      <div className="note-actions"><Button type="submit" busy={busy} disabled={!text.trim()}>Guardar</Button><Button type="button" className="text-button" disabled={busy} onClick={() => setEditing(false)}>Cancelar</Button></div>
+    </form> : <p className="note-content">{idea.content}</p>}
+    {editable && !editing && <div className="note-actions">
+      {deleting ? <><span>¿Eliminar idea?</span><Button className="text-button danger" busy={busy} onClick={async () => { if (await onDelete()) setDeleting(false) }}>Sí, eliminar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(false)}>Cancelar</Button></> : <><Button className="text-button" disabled={busy} onClick={() => { setText(idea.content); setEditing(true) }}>Editar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(true)}>Eliminar</Button></>}
+    </div>}
+    {children}
+  </article>
+}
+
 function App() {
-  const [count, setCount] = useState(0)
+  const [session, setSession] = useState<Session | null>(null)
+  const [initializing, setInitializing] = useState(!!supabase)
+  const [authError, setAuthError] = useState('')
+  const [moderatorLogin, setModeratorLogin] = useState(new URLSearchParams(location.search).has('moderador'))
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState<string | null>(null)
+  const [actionError, setActionError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [newIdea, setNewIdea] = useState('')
+  const [confirmPhase, setConfirmPhase] = useState<Phase | null>(null)
+  const { snapshot, error: syncError, refresh, updatedAt, live } = useWorkshop(session)
 
-  return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+  useEffect(() => {
+    if (!supabase) return
+    let mounted = true
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (mounted) { setSession(nextSession); setInitializing(false) }
+    })
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return
+      if (error) setAuthError(error.message)
+      setSession(data.session)
+      setInitializing(false)
+    }).catch(cause => { if (mounted) { setAuthError(errorMessage(cause)); setInitializing(false) } })
+    return () => { mounted = false; subscription.unsubscribe() }
+  }, [])
 
-      <div className="ticks"></div>
+  async function run(id: string, operation: () => Promise<void>, message = 'Cambios guardados.') {
+    if (busy) return false
+    setBusy(id); setActionError(''); setNotice('')
+    try {
+      await operation()
+      if (!['join', 'login', 'logout'].includes(id)) await refresh()
+      setNotice(message)
+      return true
+    } catch (cause) {
+      setActionError(errorMessage(cause))
+      if (!['join', 'login', 'logout'].includes(id)) await refresh()
+      return false
+    } finally { setBusy(null) }
+  }
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+  async function join(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase || !name.trim()) return
+    await run('join', async () => {
+      let current = session
+      if (!current) {
+        const { data, error } = await supabase!.auth.signInAnonymously()
+        if (error) throw error
+        current = data.session
+        if (!current) throw new Error('No pudimos iniciar la sesión anónima.')
+        setSession(current)
+      }
+      const { error } = await supabase!.rpc('join_workshop', { participant_name: name.trim() })
+      if (error) throw error
+      await refresh(current.user.id)
+    }, 'Ya estás dentro. Tu sesión se conserva al recargar.')
+  }
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
+  async function login(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase) return
+    await run('login', async () => {
+      // Verifica permisos ANTES de reemplazar la sesión del participante.
+      const temporary = moderationClient!
+      const { data, error } = await temporary.auth.signInWithPassword({ email: email.trim(), password })
+      if (error) throw error
+      const role = await temporary.rpc('is_moderator')
+      if (role.error || role.data !== true) {
+        await temporary.auth.signOut({ scope: 'local' })
+        throw role.error ?? new Error('Esta cuenta no tiene permisos de moderación. Agregá su UUID en Supabase.')
+      }
+      if (!data.session) throw new Error('No pudimos iniciar la sesión.')
+      const result = await supabase!.auth.setSession({ access_token: data.session.access_token, refresh_token: data.session.refresh_token })
+      if (result.error) throw result.error
+      setSession(result.data.session)
+      setPassword(''); setModeratorLogin(false)
+      await refresh(data.session.user.id)
+    }, 'Sesión de moderación iniciada.')
+  }
+
+  const phase = snapshot?.workshop.phase ?? 'waiting'
+  const joined = !!snapshot && (snapshot.moderator || !!snapshot.participant)
+  const loading = initializing || (!!session && !snapshot && !syncError)
+  const ownIdeas = snapshot?.ideas.filter(idea => idea.author_id === session?.user.id) ?? []
+  const completed = snapshot?.choices.length ?? 0
+  const fatalError = configurationError || authError
+
+  const saveIdea = async (idea: Idea, content: string) => run(idea.id, async () => {
+    const { data, error } = await supabase!.from('ideas').update({ content }).eq('id', idea.id).select('id').single()
+    if (error) throw error
+    if (!data) throw new Error('La escritura cerró o la idea ya no existe.')
+  })
+  const deleteIdea = async (idea: Idea) => run(idea.id, async () => {
+    const { data, error } = await supabase!.from('ideas').delete().eq('id', idea.id).select('id').single()
+    if (error) throw error
+    if (!data) throw new Error('La escritura cerró o la idea ya no existe.')
+  }, 'Idea eliminada.')
+
+  return <div className="app-shell">
+    <header className="site-header">
+      <a className="brand" href={import.meta.env.BASE_URL} aria-label="CEIDEF, inicio"><span className="brand-symbol" aria-hidden="true"><i /><i /><i /><i /></span><span>CEIDEF<small>ENCUENTRO PARTICIPATIVO</small></span></a>
+      <div className="header-actions">{joined && <span className="identity">{snapshot.moderator ? 'Moderación' : snapshot.participant?.name}</span>}
+        {!snapshot?.moderator && <Button className="text-button moderator-link" disabled={!!busy} onClick={() => { setModeratorLogin(!moderatorLogin); setActionError('') }}><Icon kind="lock" />{moderatorLogin ? 'Volver a la actividad' : 'Moderación'}</Button>}
+        {snapshot?.moderator && <Button className="text-button" disabled={!!busy} onClick={() => void run('logout', async () => { const { error } = await supabase!.auth.signOut(); if (error) throw error }, 'Sesión cerrada.')}>Salir</Button>}
+      </div>
+    </header>
+
+    <main>
+      <nav className="phase-strip" aria-label="Fases de la actividad"><ol>{PHASES.map((p, index) => <li key={p} className={phase === p ? 'active' : PHASES.indexOf(phase) > index ? 'done' : ''} aria-current={phase === p ? 'step' : undefined}><span>{PHASES.indexOf(phase) > index ? <Icon kind="check" /> : `0${index + 1}`}</span><b>{PHASE_NAMES[p]}</b></li>)}</ol><span className="session-tag">TALLER VIRTUAL · HASTA 10 PERSONAS</span></nav>
+
+      <section className="intro"><div><p className="eyebrow"><span /> PENSAR · COMPARTIR · CONECTAR</p><h1>{moderatorLogin ? 'Acompañá el encuentro.' : headings[phase]}</h1><p className="intro-description">{moderatorLogin ? 'Ingresá con la cuenta del equipo organizador para coordinar la actividad.' : descriptions[phase]}</p></div><div className="intro-art" aria-hidden="true"><div className="art-note art-blue">Cada mirada</div><div className="art-note art-peach">abre una<br />posibilidad.</div><span className="art-star">✳</span></div></section>
+
+      <div className="messages" aria-live="polite">{(fatalError || actionError || syncError) && <div className="message error" role="alert"><span>{fatalError || actionError || `No se pudo sincronizar: ${syncError}`}</span>{syncError && <Button className="text-button" onClick={() => void refresh()}>Reintentar</Button>}</div>}{busy && <div className="message saving"><span className="spinner" /> Guardando…</div>}{notice && !busy && <div className="message success"><Icon kind="check" />{notice}</div>}</div>
+
+      {loading ? <section className="panel loading"><span className="spinner" /> Recuperando tu sesión y la actividad…</section> : fatalError ? <section className="panel"><h2>Falta completar la configuración</h2><p>Revisá la configuración local y los pasos de Supabase en el README.</p></section> : moderatorLogin ? <section className="join-layout"><form className="panel join-panel" onSubmit={login}><p className="eyebrow">ACCESO DEL EQUIPO</p><h2>Ingresar como moderador</h2>{snapshot?.participant && <p className="login-warning">Usá otro navegador o perfil para moderar si querés conservar también tu acceso como participante en este dispositivo.</p>}<label htmlFor="email">Correo electrónico</label><input id="email" type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} required disabled={!!busy} /><label htmlFor="password">Contraseña</label><input id="password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'login'} disabled={!!busy}>Ingresar <Icon kind="arrow" /></Button></form><aside className="join-aside"><Icon kind="lock" /><h2>Un encuentro cuidado.</h2><p>Los permisos del equipo se verifican en la base de datos. La cuenta de moderación debe estar habilitada previamente.</p></aside></section> : !joined ? <section className="join-layout"><form className="panel join-panel" onSubmit={join}><p className="eyebrow">TU LUGAR EN LA CONVERSACIÓN</p><h2>Sumate al encuentro</h2><p>Solo necesitamos saber cómo llamarte.</p><label htmlFor="name">Tu nombre</label><input id="name" placeholder="Por ejemplo, Lucía" autoComplete="given-name" maxLength={60} value={name} onChange={e => setName(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'join'} disabled={!!busy || !name.trim() || (!!snapshot && phase !== 'waiting')}>Entrar a la actividad <Icon kind="arrow" /></Button><p className="fine-print">Sin registro ni contraseña. Tu sesión queda guardada en este navegador.</p>{snapshot && phase !== 'waiting' && <p className="login-warning">La actividad ya comenzó y cerró el ingreso de nuevos participantes.</p>}</form><aside className="join-aside"><span className="aside-number">01—04</span><h2>De una idea a una mirada compartida.</h2><p>Primero escribimos. Después, cada persona clasifica las ideas. Al final, descubrimos las conexiones.</p><div className="pill-list"><span>Hasta 3 ideas por persona</span><span>7 áreas para conectar</span><span>Elecciones individuales</span></div></aside></section> : <>
+        {snapshot.moderator && <ModeratorPanel snapshot={snapshot} busy={busy} confirmPhase={confirmPhase} setConfirmPhase={setConfirmPhase} advance={() => run('phase', async () => { const { error } = await supabase!.rpc('advance_phase', { expected_phase: phase }); if (error) throw error; setConfirmPhase(null) }, 'La nueva fase ya está abierta.')} />}
+        {phase === 'waiting' && <section className="panel waiting-panel"><span className="waiting-orbit" aria-hidden="true">✳</span><p className="eyebrow">YA ESTÁS EN EL ENCUENTRO</p><h2>{snapshot.moderator ? 'Todo listo para empezar.' : `Hola, ${snapshot.participant?.name}.`}</h2><p>{snapshot.moderator ? 'Compartí el enlace y comenzá cuando hayan ingresado los participantes.' : 'El equipo organizador dará inicio a la actividad. Podés dejar esta página abierta: se actualizará automáticamente.'}</p><div className="waiting-status"><span className="status-dot" /> Esperando el inicio de la escritura</div></section>}
+
+        {phase !== 'waiting' && <section className="board-section">
+          <div className="section-heading"><div><p className="eyebrow">{phase === 'ideas' ? 'PRIMER PASO · ESCRIBIR' : phase === 'classification' ? 'SEGUNDO PASO · CONECTAR' : 'EL MAPA DEL ENCUENTRO'}</p><h2>{phase === 'ideas' ? snapshot.moderator ? 'Ideas del equipo organizador' : 'Tus post-its' : 'Nuestro mural de ideas'}</h2></div><span className="count-badge">{phase === 'ideas' && !snapshot.moderator ? `${ownIdeas.length} de 3 ideas` : `${snapshot.ideas.length} ideas`}</span></div>
+          <p className="board-help">{phase === 'ideas' ? snapshot.moderator ? 'Las ideas del equipo se identifican para todos. Solo podés editar las que creaste.' : 'Escribí una idea por post-it. Durante esta fase, solo vos podés ver tus ideas.' : phase === 'classification' ? snapshot.moderator ? 'Las elecciones individuales permanecen privadas. Seguí el avance en el panel de participantes.' : 'Tus elecciones son privadas. Podés cambiarlas hasta que el equipo cierre esta fase.' : 'Cada listado incluye las siete áreas y el total de respuestas recibidas.'}</p>
+
+          {phase === 'classification' && snapshot.participant && <div className="personal-progress"><div><strong>{completed} de {snapshot.ideas.length} ideas clasificadas</strong><span>{completed === snapshot.ideas.length && snapshot.ideas.length > 0 ? '¡Terminaste! Podés revisar tus elecciones.' : 'Guardamos cada elección al seleccionarla.'}</span></div><progress value={completed} max={snapshot.ideas.length || 1} aria-label="Tu progreso de clasificación" /></div>}
+
+          <div className="notes-grid">
+            {snapshot.ideas.map(idea => <Note key={idea.id} idea={idea} editable={phase === 'ideas' && idea.author_id === session?.user.id} busy={!!busy} onSave={text => saveIdea(idea, text)} onDelete={() => deleteIdea(idea)}>
+              {phase === 'classification' && snapshot.participant && <div className="classification"><label htmlFor={`area-${idea.id}`}>¿Con qué área se relaciona?</label><select id={`area-${idea.id}`} value={snapshot.choices.find(c => c.idea_id === idea.id)?.area_id ?? ''} disabled={!!busy} onChange={e => { const areaId = Number(e.target.value); void run(idea.id, async () => { const { error } = await supabase!.rpc('classify_idea', { target_idea: idea.id, selected_area: areaId }); if (error) throw error }, 'Elección guardada.') }}><option value="" disabled>Elegí un área…</option>{AREAS.map((area, i) => <option key={area} value={i + 1}>{area}</option>)}</select><small>{snapshot.choices.some(c => c.idea_id === idea.id) ? '✓ Elección guardada' : 'Pendiente de clasificar'}</small></div>}
+              {phase === 'results' && <div className="results-list"><p className="result-label">ELECCIONES POR ÁREA</p><ul>{AREAS.map((area, index) => { const count = snapshot.results.find(r => r.idea_id === idea.id && r.area_id === index + 1)?.votes ?? 0; return <li key={area}><span>{area}</span><b className={count > 0 ? 'has-votes' : ''}>{count}</b></li> })}</ul><div className="result-total"><span>Total de respuestas</span><strong>{snapshot.results.find(r => r.idea_id === idea.id)?.total ?? 0}</strong></div></div>}
+            </Note>)}
+            {phase === 'ideas' && (snapshot.moderator || ownIdeas.length < 3) && <form className="note new-note" onSubmit={async event => { event.preventDefault(); if (!newIdea.trim()) return; const saved = await run('new-idea', async () => { const { error } = await supabase!.from('ideas').insert({ author_id: session!.user.id, content: newIdea.trim(), organizer: snapshot.moderator }); if (error) throw error }); if (saved) setNewIdea('') }}><div className="note-top"><Icon kind="plus" /><span>{snapshot.moderator ? 'Equipo organizador' : 'Una nueva idea'}</span></div><label htmlFor="new-idea">¿Qué te gustaría proponer?</label><textarea id="new-idea" placeholder="Una oportunidad, un desafío, una propuesta…" value={newIdea} onChange={e => setNewIdea(e.target.value)} maxLength={500} required disabled={!!busy} /><div className="new-note-bottom"><small>{newIdea.length}/500</small><Button type="submit" className="primary" busy={busy === 'new-idea'} disabled={!!busy || !newIdea.trim()}>Guardar idea <Icon kind="plus" /></Button></div></form>}
+          </div>
+          {snapshot.ideas.length === 0 && phase !== 'ideas' && <div className="panel empty-state"><h3>No se guardaron ideas.</h3><p>El equipo organizador cerró la escritura sin post-its.</p></div>}
+        </section>}
+      </>}
+    </main>
+    <footer><span>CEIDEF <span className="footer-separator">/</span> Ideas que conectan.</span><span className="sync-status"><span className={`status-dot ${syncError ? 'offline' : ''}`} />{session ? syncError ? 'Sin sincronizar · reintentando' : live ? 'Fases en vivo · guardado en Supabase' : updatedAt ? 'Sincronización cada 5 segundos' : 'Conectando…' : 'Un espacio de construcción colectiva'}</span></footer>
+  </div>
+}
+
+function ModeratorPanel({ snapshot, busy, confirmPhase, setConfirmPhase, advance }: {
+  snapshot: Snapshot; busy: string | null; confirmPhase: Phase | null;
+  setConfirmPhase: (phase: Phase | null) => void; advance: () => Promise<boolean>;
+}) {
+  const phase = snapshot.workshop.phase
+  const totalCompleted = snapshot.progress.reduce((sum, p) => sum + p.completed, 0)
+  const totalExpected = snapshot.progress.length * snapshot.ideas.length
+  return <section className="moderator-panel panel"><div className="moderator-heading"><div><p className="eyebrow">PANEL DE MODERACIÓN</p><h2>El pulso del encuentro</h2></div><span className="phase-label">{PHASE_NAMES[phase]}</span></div><div className="moderator-controls"><div className="stats"><div><strong>{snapshot.progress.length}<small>/ 10</small></strong><span>Participantes</span></div><div><strong>{snapshot.ideas.length}</strong><span>Ideas guardadas</span></div><div><strong>{totalCompleted}<small>/ {totalExpected}</small></strong><span>Clasificaciones</span></div></div><div className="control-buttons"><Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, false)}><Icon kind="download" /> Ideas CSV</Button>{phase === 'results' && <Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, true)}><Icon kind="download" /> Resultados CSV</Button>}{phase !== 'results' && <Button className="primary" disabled={!!busy} onClick={() => setConfirmPhase(phase)}>{nextLabels[phase]} <Icon kind="arrow" /></Button>}</div></div>
+    <details className="participant-details" open={phase === 'waiting' || phase === 'classification'}><summary>Participantes y progreso ({snapshot.progress.length})</summary>{snapshot.progress.length === 0 ? <p>Todavía no ingresaron participantes.</p> : <ul>{snapshot.progress.map(p => <li key={p.user_id}><span className="participant-avatar" aria-hidden="true">{p.name.charAt(0).toUpperCase()}</span><span>{p.name}</span><span className="participant-count">{phase === 'waiting' || phase === 'ideas' ? 'En la actividad' : `${p.completed} / ${p.total}`}</span>{phase !== 'waiting' && phase !== 'ideas' && <progress value={p.completed} max={p.total || 1} aria-label={`Progreso de ${p.name}`} />}</li>)}</ul>}</details>
+    {confirmPhase === phase && <div className="phase-confirm" role="alert"><div><strong>{phase === 'waiting' ? '¿Comenzar la actividad?' : phase === 'ideas' ? '¿Cerrar la escritura de ideas?' : '¿Cerrar la clasificación?'}</strong><p>{phase === 'waiting' ? 'Se cerrará el ingreso de participantes y podrán comenzar a escribir.' : phase === 'ideas' ? 'Las ideas quedarán bloqueadas y serán visibles para todos. Este cambio no se puede deshacer desde la aplicación.' : `Hay ${totalCompleted} de ${totalExpected} respuestas guardadas. Al cerrar no podrán cambiarse y se mostrarán los resultados.`}</p></div><Button className="primary" busy={busy === 'phase'} disabled={!!busy} onClick={() => void advance()}>Confirmar cambio</Button><Button className="text-button" disabled={!!busy} onClick={() => setConfirmPhase(null)}>Cancelar</Button></div>}
+  </section>
 }
 
 export default App

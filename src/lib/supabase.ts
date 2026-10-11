@@ -12,3 +12,8 @@ export const configurationError = !url || !key
 export const supabase = configurationError ? null : createClient(url, key, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
 })
+
+// Al verificar credenciales de moderación se conserva la identidad participante.
+export const moderationClient = configurationError ? null : createClient(url, key, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: 'ceidef-moderation-check' },
+})
