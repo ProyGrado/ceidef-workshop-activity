@@ -13,6 +13,20 @@
   --muted: #606462;
   --line: #d8d5cd;
   --surface: #fcfaf6;
+  --note-yellow: #FFD85A;
+  --note-yellow-edge: #E8B826;
+  --note-green: #9FE3A6;
+  --note-green-edge: #6BBE7B;
+  --note-blue: #9BD8F4;
+  --note-blue-edge: #63B8E0;
+  --note-team: #FFB08B;
+  --note-team-edge: #EF875A;
+  --area-peach: #FFC8A0;
+  --area-lilac: #DCC5FF;
+  --area-mint: #AAE5C2;
+  --area-sky: #A9DCF5;
+  --area-yellow: #FFE480;
+  --area-pink: #F7BED6;
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; }

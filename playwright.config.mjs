@@ -6,7 +6,7 @@ export default defineConfig({
   workers: 1,
   timeout: 60000,
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: 'http://127.0.0.1:5199',
     trace: 'retain-on-failure',
     launchOptions: process.env.PLAYWRIGHT_EXECUTABLE_PATH
       ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH }
@@ -17,8 +17,8 @@ export default defineConfig({
     { name: 'mobile', use: { ...devices['iPhone 13'], defaultBrowserType: 'chromium' } },
   ],
   webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 5173 --strictPort',
-    url: 'http://127.0.0.1:5173',
+    command: 'npm run dev -- --host 127.0.0.1 --port 5199 --strictPort',
+    url: 'http://127.0.0.1:5199',
     reuseExistingServer: false,
     env: { VITE_SUPABASE_URL: 'http://supabase.test', VITE_SUPABASE_PUBLISHABLE_KEY: 'test-publishable-key' },
   },

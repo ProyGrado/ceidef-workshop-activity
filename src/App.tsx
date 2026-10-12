@@ -1,16 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ButtonHTMLAttributes, FormEvent, ReactNode } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { configurationError, moderationClient, supabase } from './lib/supabase'
 import { useWorkshop } from './hooks/useWorkshop'
-import { AREAS, PHASE_NAMES, PHASES, downloadCsv, errorMessage } from './lib/workshop'
-import type { Idea, Phase, Snapshot } from './lib/workshop'
+import { AREAS, MAX_IDEAS, MAX_PARTICIPANTS, PHASE_NAMES, PHASES, downloadCsv, emptyIdeaDraft, errorMessage, ideaDraft, indexResults, isCompleteIdea } from './lib/workshop'
+import type { Idea, IdeaDraft, Phase, Snapshot } from './lib/workshop'
+import { IdeaContent, IdeaFields } from './components/IdeaFields'
+import { AreaLabels, IdeaAreas } from './components/AreaLabels'
 import './App.css'
 
 const descriptions: Record<Phase, string> = {
   waiting: 'Un espacio para pensar juntos el futuro de la farmacoterapia.',
-  ideas: '¿Qué oportunidades o desafíos identificás en la práctica farmacoterapéutica?',
-  classification: 'Leé cada idea y elegí el área con la que más se relaciona.',
+  ideas: 'Contanos la tarea que proponés. Si querés, agregá detalles para explicar cómo funcionaría.',
+  classification: 'Leé cada idea y conectala con una, varias áreas o ninguna.',
   results: 'Distintas miradas, un mapa compartido. Así clasificamos nuestras ideas.',
 }
 const headings: Record<Phase, string> = {
@@ -31,26 +33,25 @@ function Button({ children, busy, ...props }: ButtonHTMLAttributes<HTMLButtonEle
 }
 
 function Note({ idea, editable, onSave, onDelete, busy, children }: {
-  idea: Idea; editable: boolean; onSave: (text: string) => Promise<boolean>;
+  idea: Idea; editable: boolean; onSave: (draft: IdeaDraft) => Promise<boolean>;
   onDelete: () => Promise<boolean>; busy: boolean; children?: ReactNode;
 }) {
   const [editing, setEditing] = useState(false)
-  const [text, setText] = useState(idea.content)
+  const [draft, setDraft] = useState(() => ideaDraft(idea))
   const [deleting, setDeleting] = useState(false)
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (await onSave(text.trim())) setEditing(false)
+    if (isCompleteIdea(draft) && await onSave(ideaDraft(draft))) setEditing(false)
   }
   return <article className={`note ${idea.organizer ? 'note-team' : ''}`}>
-    <div className="note-top"><span className="note-dot" /><span>{idea.organizer ? 'Equipo organizador' : 'Idea participante'}</span></div>
+    <div className="note-top"><span className="note-dot" /><span>{idea.preset ? 'Idea predeterminada · Equipo organizador' : idea.organizer ? 'Equipo organizador' : 'Idea participante'}</span></div>
+    {idea.title && <h3 className="preset-title">{idea.title}</h3>}
     {editing && editable ? <form onSubmit={submit}>
-      <label className="sr-only" htmlFor={`edit-${idea.id}`}>Editar idea</label>
-      <textarea id={`edit-${idea.id}`} value={text} onChange={e => setText(e.target.value)} maxLength={500} required autoFocus disabled={busy} />
-      <small>{text.length}/500</small>
-      <div className="note-actions"><Button type="submit" busy={busy} disabled={!text.trim()}>Guardar</Button><Button type="button" className="text-button" disabled={busy} onClick={() => setEditing(false)}>Cancelar</Button></div>
-    </form> : <p className="note-content">{idea.content}</p>}
+      <IdeaFields value={draft} onChange={setDraft} disabled={busy} idPrefix={`edit-${idea.id}`} />
+      <div className="note-actions"><Button type="submit" busy={busy} disabled={!isCompleteIdea(draft)}>Guardar</Button><Button type="button" className="text-button" disabled={busy} onClick={() => setEditing(false)}>Cancelar</Button></div>
+    </form> : <IdeaContent idea={idea} />}
     {editable && !editing && <div className="note-actions">
-      {deleting ? <><span>¿Eliminar idea?</span><Button className="text-button danger" busy={busy} onClick={async () => { if (await onDelete()) setDeleting(false) }}>Sí, eliminar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(false)}>Cancelar</Button></> : <><Button className="text-button" disabled={busy} onClick={() => { setText(idea.content); setEditing(true) }}>Editar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(true)}>Eliminar</Button></>}
+      {deleting ? <><span>¿Eliminar idea?</span><Button className="text-button danger" busy={busy} onClick={async () => { if (await onDelete()) setDeleting(false) }}>Sí, eliminar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(false)}>Cancelar</Button></> : <><Button className="text-button" disabled={busy} onClick={() => { setDraft(ideaDraft(idea)); setEditing(true) }}>Editar</Button><Button className="text-button" disabled={busy} onClick={() => setDeleting(true)}>Eliminar</Button></>}
     </div>}
     {children}
   </article>
@@ -67,9 +68,11 @@ function App() {
   const [busy, setBusy] = useState<string | null>(null)
   const [actionError, setActionError] = useState('')
   const [notice, setNotice] = useState('')
-  const [newIdea, setNewIdea] = useState('')
+  const [newIdea, setNewIdea] = useState(emptyIdeaDraft)
   const [confirmPhase, setConfirmPhase] = useState<Phase | null>(null)
   const { snapshot, error: syncError, refresh, updatedAt, live } = useWorkshop(session)
+  const resultsByIdea = useMemo(() => indexResults(snapshot?.results ?? []), [snapshot?.results])
+  const choicesByIdea = useMemo(() => new Map(snapshot?.choices.map(c => [c.idea_id, c.area_ids]) ?? []), [snapshot?.choices])
 
   useEffect(() => {
     if (!supabase) return
@@ -148,8 +151,8 @@ function App() {
   const completed = snapshot?.choices.length ?? 0
   const fatalError = configurationError || authError
 
-  const saveIdea = async (idea: Idea, content: string) => run(idea.id, async () => {
-    const { data, error } = await supabase!.from('ideas').update({ content }).eq('id', idea.id).select('id').single()
+  const saveIdea = async (idea: Idea, draft: IdeaDraft) => run(idea.id, async () => {
+    const { data, error } = await supabase!.from('ideas').update(draft).eq('id', idea.id).select('id').single()
     if (error) throw error
     if (!data) throw new Error('La escritura cerró o la idea ya no existe.')
   })
@@ -158,6 +161,10 @@ function App() {
     if (error) throw error
     if (!data) throw new Error('La escritura cerró o la idea ya no existe.')
   }, 'Idea eliminada.')
+  const classify = (ideaId: string, areas: number[]) => run(ideaId, async () => {
+    const { error } = await supabase!.rpc('classify_idea', { target_idea: ideaId, selected_areas: areas })
+    if (error) throw error
+  }, areas.length ? 'Áreas guardadas.' : 'Respuesta guardada sin áreas.')
 
   return <div className="app-shell">
     <header className="site-header">
@@ -169,29 +176,49 @@ function App() {
     </header>
 
     <main>
-      <nav className="phase-strip" aria-label="Fases de la actividad"><ol>{PHASES.map((p, index) => <li key={p} className={phase === p ? 'active' : PHASES.indexOf(phase) > index ? 'done' : ''} aria-current={phase === p ? 'step' : undefined}><span>{PHASES.indexOf(phase) > index ? <Icon kind="check" /> : `0${index + 1}`}</span><b>{PHASE_NAMES[p]}</b></li>)}</ol><span className="session-tag">TALLER VIRTUAL · HASTA 10 PERSONAS</span></nav>
+      <nav className="phase-strip" aria-label="Fases de la actividad"><ol>{PHASES.map((p, index) => <li key={p} className={phase === p ? 'active' : PHASES.indexOf(phase) > index ? 'done' : ''} aria-current={phase === p ? 'step' : undefined}><span>{PHASES.indexOf(phase) > index ? <Icon kind="check" /> : `0${index + 1}`}</span><b>{PHASE_NAMES[p]}</b></li>)}</ol><span className="session-tag">TALLER VIRTUAL · HASTA {MAX_PARTICIPANTS} PERSONAS</span></nav>
 
       <section className="intro"><div><p className="eyebrow"><span /> PENSAR · COMPARTIR · CONECTAR</p><h1>{moderatorLogin ? 'Acompañá el encuentro.' : headings[phase]}</h1><p className="intro-description">{moderatorLogin ? 'Ingresá con la cuenta del equipo organizador para coordinar la actividad.' : descriptions[phase]}</p></div><div className="intro-art" aria-hidden="true"><div className="art-note art-blue">Cada mirada</div><div className="art-note art-peach">abre una<br />posibilidad.</div><span className="art-star">✳</span></div></section>
 
       <div className="messages" aria-live="polite">{(fatalError || actionError || syncError) && <div className="message error" role="alert"><span>{fatalError || actionError || `No se pudo sincronizar: ${syncError}`}</span>{syncError && <Button className="text-button" onClick={() => void refresh()}>Reintentar</Button>}</div>}{busy && <div className="message saving"><span className="spinner" /> Guardando…</div>}{notice && !busy && <div className="message success"><Icon kind="check" />{notice}</div>}</div>
 
-      {loading ? <section className="panel loading"><span className="spinner" /> Recuperando tu sesión y la actividad…</section> : fatalError ? <section className="panel"><h2>Falta completar la configuración</h2><p>Revisá la configuración local y los pasos de Supabase en el README.</p></section> : moderatorLogin ? <section className="join-layout"><form className="panel join-panel" onSubmit={login}><p className="eyebrow">ACCESO DEL EQUIPO</p><h2>Ingresar como moderador</h2>{snapshot?.participant && <p className="login-warning">Usá otro navegador o perfil para moderar si querés conservar también tu acceso como participante en este dispositivo.</p>}<label htmlFor="email">Correo electrónico</label><input id="email" type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} required disabled={!!busy} /><label htmlFor="password">Contraseña</label><input id="password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'login'} disabled={!!busy}>Ingresar <Icon kind="arrow" /></Button></form><aside className="join-aside"><Icon kind="lock" /><h2>Un encuentro cuidado.</h2><p>Los permisos del equipo se verifican en la base de datos. La cuenta de moderación debe estar habilitada previamente.</p></aside></section> : !joined ? <section className="join-layout"><form className="panel join-panel" onSubmit={join}><p className="eyebrow">TU LUGAR EN LA CONVERSACIÓN</p><h2>Sumate al encuentro</h2><p>Solo necesitamos saber cómo llamarte.</p><label htmlFor="name">Tu nombre</label><input id="name" placeholder="Por ejemplo, Lucía" autoComplete="given-name" maxLength={60} value={name} onChange={e => setName(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'join'} disabled={!!busy || !name.trim() || (!!snapshot && phase !== 'waiting')}>Entrar a la actividad <Icon kind="arrow" /></Button><p className="fine-print">Sin registro ni contraseña. Tu sesión queda guardada en este navegador.</p>{snapshot && phase !== 'waiting' && <p className="login-warning">La actividad ya comenzó y cerró el ingreso de nuevos participantes.</p>}</form><aside className="join-aside"><span className="aside-number">01—04</span><h2>De una idea a una mirada compartida.</h2><p>Primero escribimos. Después, cada persona clasifica las ideas. Al final, descubrimos las conexiones.</p><div className="pill-list"><span>Hasta 3 ideas por persona</span><span>7 áreas para conectar</span><span>Elecciones individuales</span></div></aside></section> : <>
+      {loading ? <section className="panel loading"><span className="spinner" /> Recuperando tu sesión y la actividad…</section> : fatalError ? <section className="panel"><h2>Falta completar la configuración</h2><p>Revisá la configuración local y los pasos de Supabase en el README.</p></section> : moderatorLogin ? <section className="join-layout"><form className="panel join-panel" onSubmit={login}><p className="eyebrow">ACCESO DEL EQUIPO</p><h2>Ingresar como moderador</h2>{snapshot?.participant && <p className="login-warning">Usá otro navegador o perfil para moderar si querés conservar también tu acceso como participante en este dispositivo.</p>}<label htmlFor="email">Correo electrónico</label><input id="email" type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} required disabled={!!busy} /><label htmlFor="password">Contraseña</label><input id="password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'login'} disabled={!!busy}>Ingresar <Icon kind="arrow" /></Button></form><aside className="join-aside"><Icon kind="lock" /><h2>Un encuentro cuidado.</h2><p>Los permisos del equipo se verifican en la base de datos. La cuenta de moderación debe estar habilitada previamente.</p></aside></section> : !joined ? <section className="join-layout"><form className="panel join-panel" onSubmit={join}><p className="eyebrow">TU LUGAR EN LA CONVERSACIÓN</p><h2>Sumate al encuentro</h2><p>Solo necesitamos saber cómo llamarte.</p><label htmlFor="name">Tu nombre</label><input id="name" placeholder="Por ejemplo, Lucía" autoComplete="given-name" maxLength={60} value={name} onChange={e => setName(e.target.value)} required disabled={!!busy} /><Button type="submit" className="primary" busy={busy === 'join'} disabled={!!busy || !name.trim() || (!!snapshot && phase !== 'waiting')}>Entrar a la actividad <Icon kind="arrow" /></Button><p className="fine-print">Sin registro ni contraseña. Tu sesión queda guardada en este navegador.</p>{snapshot && phase !== 'waiting' && <p className="login-warning">La actividad ya comenzó y cerró el ingreso de nuevos participantes.</p>}</form><aside className="join-aside"><span className="aside-number">01—04</span><h2>De una idea a una mirada compartida.</h2><p>Primero escribimos. Después, cada persona clasifica las ideas. Al final, descubrimos las conexiones.</p><div className="pill-list"><span>Hasta {MAX_IDEAS} ideas por persona</span><span>{AREAS.length} áreas para conectar</span><span>Elecciones individuales</span></div></aside></section> : <>
         {snapshot.moderator && <ModeratorPanel snapshot={snapshot} busy={busy} confirmPhase={confirmPhase} setConfirmPhase={setConfirmPhase} advance={() => run('phase', async () => { const { error } = await supabase!.rpc('advance_phase', { expected_phase: phase }); if (error) throw error; setConfirmPhase(null) }, 'La nueva fase ya está abierta.')} />}
         {phase === 'waiting' && <section className="panel waiting-panel"><span className="waiting-orbit" aria-hidden="true">✳</span><p className="eyebrow">YA ESTÁS EN EL ENCUENTRO</p><h2>{snapshot.moderator ? 'Todo listo para empezar.' : `Hola, ${snapshot.participant?.name}.`}</h2><p>{snapshot.moderator ? 'Compartí el enlace y comenzá cuando hayan ingresado los participantes.' : 'El equipo organizador dará inicio a la actividad. Podés dejar esta página abierta: se actualizará automáticamente.'}</p><div className="waiting-status"><span className="status-dot" /> Esperando el inicio de la escritura</div></section>}
 
         {phase !== 'waiting' && <section className="board-section">
-          <div className="section-heading"><div><p className="eyebrow">{phase === 'ideas' ? 'PRIMER PASO · ESCRIBIR' : phase === 'classification' ? 'SEGUNDO PASO · CONECTAR' : 'EL MAPA DEL ENCUENTRO'}</p><h2>{phase === 'ideas' ? snapshot.moderator ? 'Ideas del equipo organizador' : 'Tus post-its' : 'Nuestro mural de ideas'}</h2></div><span className="count-badge">{phase === 'ideas' && !snapshot.moderator ? `${ownIdeas.length} de 3 ideas` : `${snapshot.ideas.length} ideas`}</span></div>
-          <p className="board-help">{phase === 'ideas' ? snapshot.moderator ? 'Las ideas del equipo se identifican para todos. Solo podés editar las que creaste.' : 'Escribí una idea por post-it. Durante esta fase, solo vos podés ver tus ideas.' : phase === 'classification' ? snapshot.moderator ? 'Las elecciones individuales permanecen privadas. Seguí el avance en el panel de participantes.' : 'Tus elecciones son privadas. Podés cambiarlas hasta que el equipo cierre esta fase.' : 'Cada listado incluye las siete áreas y el total de respuestas recibidas.'}</p>
+          <div className="section-heading"><div><p className="eyebrow">{phase === 'ideas' ? 'PRIMER PASO · ESCRIBIR' : phase === 'classification' ? 'SEGUNDO PASO · CONECTAR' : 'EL MAPA DEL ENCUENTRO'}</p><h2>{phase === 'ideas' ? snapshot.moderator ? 'Ideas del equipo organizador' : 'Tus post-its' : 'Nuestro mural de ideas'}</h2></div><span className="count-badge">{phase === 'ideas' && !snapshot.moderator ? `${ownIdeas.length} de ${MAX_IDEAS} ideas` : `${snapshot.ideas.length} ideas`}</span></div>
+          <p className="board-help">{phase === 'ideas' ? snapshot.moderator ? 'Las ideas del equipo se identifican para todos. Solo podés editar las que creaste.' : 'Describí la tarea y completá los detalles que quieras. Durante esta fase, solo vos podés ver tus ideas.' : phase === 'classification' ? snapshot.moderator ? 'Las elecciones individuales permanecen privadas. Seguí el avance en el panel de participantes.' : 'Tus elecciones son privadas. Podés cambiarlas hasta que el equipo cierre esta fase.' : 'Cada listado incluye las seis áreas y las respuestas sin áreas. Una respuesta puede incluir varias etiquetas.'}</p>
 
           {phase === 'classification' && snapshot.participant && <div className="personal-progress"><div><strong>{completed} de {snapshot.ideas.length} ideas clasificadas</strong><span>{completed === snapshot.ideas.length && snapshot.ideas.length > 0 ? '¡Terminaste! Podés revisar tus elecciones.' : 'Guardamos cada elección al seleccionarla.'}</span></div><progress value={completed} max={snapshot.ideas.length || 1} aria-label="Tu progreso de clasificación" /></div>}
 
+          {phase === 'ideas' && (snapshot.moderator || ownIdeas.length < MAX_IDEAS) &&
+            <form className="panel idea-composer" onSubmit={async event => {
+              event.preventDefault()
+              if (!isCompleteIdea(newIdea)) return
+              const saved = await run('new-idea', async () => {
+                const { error } = await supabase!.from('ideas').insert({ author_id: session!.user.id, ...ideaDraft(newIdea), organizer: snapshot.moderator })
+                if (error) throw error
+              })
+              if (saved) setNewIdea(emptyIdeaDraft())
+            }}>
+              <div className="composer-heading"><div><p className="eyebrow">UNA NUEVA IDEA</p><h3>{snapshot.moderator ? 'Propuesta del equipo organizador' : 'Definí tu propuesta'}</h3></div><Icon kind="plus" /></div>
+              <p className="composer-help">Solo Tarea es obligatoria. Los demás campos son opcionales.</p>
+              <IdeaFields value={newIdea} onChange={setNewIdea} disabled={!!busy} idPrefix="new-idea" />
+              <div className="composer-actions"><small>Hasta 500 caracteres por campo.</small><Button type="submit" className="primary" busy={busy === 'new-idea'} disabled={!!busy || !isCompleteIdea(newIdea)}>Guardar idea <Icon kind="plus" /></Button></div>
+            </form>}
+          <AreaLabels active={phase === 'classification' && !!snapshot.participant} busy={!!busy} onAssign={(ideaId, area) => {
+            if (phase !== 'classification' || !snapshot.participant) return
+            const selected = choicesByIdea.get(ideaId) ?? []
+            if (!selected.includes(area)) void classify(ideaId, [...selected, area].sort((a, b) => a - b))
+          }}>
           <div className="notes-grid">
-            {snapshot.ideas.map(idea => <Note key={idea.id} idea={idea} editable={phase === 'ideas' && idea.author_id === session?.user.id} busy={!!busy} onSave={text => saveIdea(idea, text)} onDelete={() => deleteIdea(idea)}>
-              {phase === 'classification' && snapshot.participant && <div className="classification"><label htmlFor={`area-${idea.id}`}>¿Con qué área se relaciona?</label><select id={`area-${idea.id}`} value={snapshot.choices.find(c => c.idea_id === idea.id)?.area_id ?? ''} disabled={!!busy} onChange={e => { const areaId = Number(e.target.value); void run(idea.id, async () => { const { error } = await supabase!.rpc('classify_idea', { target_idea: idea.id, selected_area: areaId }); if (error) throw error }, 'Elección guardada.') }}><option value="" disabled>Elegí un área…</option>{AREAS.map((area, i) => <option key={area} value={i + 1}>{area}</option>)}</select><small>{snapshot.choices.some(c => c.idea_id === idea.id) ? '✓ Elección guardada' : 'Pendiente de clasificar'}</small></div>}
-              {phase === 'results' && <div className="results-list"><p className="result-label">ELECCIONES POR ÁREA</p><ul>{AREAS.map((area, index) => { const count = snapshot.results.find(r => r.idea_id === idea.id && r.area_id === index + 1)?.votes ?? 0; return <li key={area}><span>{area}</span><b className={count > 0 ? 'has-votes' : ''}>{count}</b></li> })}</ul><div className="result-total"><span>Total de respuestas</span><strong>{snapshot.results.find(r => r.idea_id === idea.id)?.total ?? 0}</strong></div></div>}
+            {snapshot.ideas.map(idea => <Note key={idea.id} idea={idea} editable={phase === 'ideas' && !idea.preset && idea.author_id === session?.user.id} busy={!!busy} onSave={draft => saveIdea(idea, draft)} onDelete={() => deleteIdea(idea)}>
+              {phase === 'classification' && snapshot.participant && <IdeaAreas ideaId={idea.id} selected={choicesByIdea.get(idea.id)} onChange={areas => { void classify(idea.id, areas) }} />}
+              {phase === 'results' && <div className="results-list"><p className="result-label">ELECCIONES POR ÁREA</p><ul>{AREAS.map((area, index) => { const count = resultsByIdea.get(idea.id)?.find(r => r.area_id === index + 1)?.votes ?? 0; return <li key={area}><span>{area}</span><b className={count > 0 ? 'has-votes' : ''}>{count}</b></li> })}</ul><div className="result-none"><span>Sin áreas</span><strong>{resultsByIdea.get(idea.id)?.[0]?.no_area ?? 0}</strong></div><div className="result-total"><span>Total de respuestas</span><strong>{resultsByIdea.get(idea.id)?.[0]?.total ?? 0}</strong></div></div>}
             </Note>)}
-            {phase === 'ideas' && (snapshot.moderator || ownIdeas.length < 3) && <form className="note new-note" onSubmit={async event => { event.preventDefault(); if (!newIdea.trim()) return; const saved = await run('new-idea', async () => { const { error } = await supabase!.from('ideas').insert({ author_id: session!.user.id, content: newIdea.trim(), organizer: snapshot.moderator }); if (error) throw error }); if (saved) setNewIdea('') }}><div className="note-top"><Icon kind="plus" /><span>{snapshot.moderator ? 'Equipo organizador' : 'Una nueva idea'}</span></div><label htmlFor="new-idea">¿Qué te gustaría proponer?</label><textarea id="new-idea" placeholder="Una oportunidad, un desafío, una propuesta…" value={newIdea} onChange={e => setNewIdea(e.target.value)} maxLength={500} required disabled={!!busy} /><div className="new-note-bottom"><small>{newIdea.length}/500</small><Button type="submit" className="primary" busy={busy === 'new-idea'} disabled={!!busy || !newIdea.trim()}>Guardar idea <Icon kind="plus" /></Button></div></form>}
           </div>
+          </AreaLabels>
           {snapshot.ideas.length === 0 && phase !== 'ideas' && <div className="panel empty-state"><h3>No se guardaron ideas.</h3><p>El equipo organizador cerró la escritura sin post-its.</p></div>}
         </section>}
       </>}
@@ -207,7 +234,7 @@ function ModeratorPanel({ snapshot, busy, confirmPhase, setConfirmPhase, advance
   const phase = snapshot.workshop.phase
   const totalCompleted = snapshot.progress.reduce((sum, p) => sum + p.completed, 0)
   const totalExpected = snapshot.progress.length * snapshot.ideas.length
-  return <section className="moderator-panel panel"><div className="moderator-heading"><div><p className="eyebrow">PANEL DE MODERACIÓN</p><h2>El pulso del encuentro</h2></div><span className="phase-label">{PHASE_NAMES[phase]}</span></div><div className="moderator-controls"><div className="stats"><div><strong>{snapshot.progress.length}<small>/ 10</small></strong><span>Participantes</span></div><div><strong>{snapshot.ideas.length}</strong><span>Ideas guardadas</span></div><div><strong>{totalCompleted}<small>/ {totalExpected}</small></strong><span>Clasificaciones</span></div></div><div className="control-buttons"><Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, false)}><Icon kind="download" /> Ideas CSV</Button>{phase === 'results' && <Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, true)}><Icon kind="download" /> Resultados CSV</Button>}{phase !== 'results' && <Button className="primary" disabled={!!busy} onClick={() => setConfirmPhase(phase)}>{nextLabels[phase]} <Icon kind="arrow" /></Button>}</div></div>
+  return <section className="moderator-panel panel"><div className="moderator-heading"><div><p className="eyebrow">PANEL DE MODERACIÓN</p><h2>El pulso del encuentro</h2></div><span className="phase-label">{PHASE_NAMES[phase]}</span></div><div className="moderator-controls"><div className="stats"><div><strong>{snapshot.progress.length}<small>/ {MAX_PARTICIPANTS}</small></strong><span>Participantes</span></div><div><strong>{snapshot.ideas.length}</strong><span>Ideas guardadas</span></div><div><strong>{totalCompleted}<small>/ {totalExpected}</small></strong><span>Clasificaciones</span></div></div><div className="control-buttons"><Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, false)}><Icon kind="download" /> Ideas CSV</Button>{phase === 'results' && <Button className="secondary" disabled={!!busy} onClick={() => downloadCsv(snapshot, true)}><Icon kind="download" /> Resultados CSV</Button>}{phase !== 'results' && <Button className="primary" disabled={!!busy} onClick={() => setConfirmPhase(phase)}>{nextLabels[phase]} <Icon kind="arrow" /></Button>}</div></div>
     <details className="participant-details" open={phase === 'waiting' || phase === 'classification'}><summary>Participantes y progreso ({snapshot.progress.length})</summary>{snapshot.progress.length === 0 ? <p>Todavía no ingresaron participantes.</p> : <ul>{snapshot.progress.map(p => <li key={p.user_id}><span className="participant-avatar" aria-hidden="true">{p.name.charAt(0).toUpperCase()}</span><span>{p.name}</span><span className="participant-count">{phase === 'waiting' || phase === 'ideas' ? 'En la actividad' : `${p.completed} / ${p.total}`}</span>{phase !== 'waiting' && phase !== 'ideas' && <progress value={p.completed} max={p.total || 1} aria-label={`Progreso de ${p.name}`} />}</li>)}</ul>}</details>
     {confirmPhase === phase && <div className="phase-confirm" role="alert"><div><strong>{phase === 'waiting' ? '¿Comenzar la actividad?' : phase === 'ideas' ? '¿Cerrar la escritura de ideas?' : '¿Cerrar la clasificación?'}</strong><p>{phase === 'waiting' ? 'Se cerrará el ingreso de participantes y podrán comenzar a escribir.' : phase === 'ideas' ? 'Las ideas quedarán bloqueadas y serán visibles para todos. Este cambio no se puede deshacer desde la aplicación.' : `Hay ${totalCompleted} de ${totalExpected} respuestas guardadas. Al cerrar no podrán cambiarse y se mostrarán los resultados.`}</p></div><Button className="primary" busy={busy === 'phase'} disabled={!!busy} onClick={() => void advance()}>Confirmar cambio</Button><Button className="text-button" disabled={!!busy} onClick={() => setConfirmPhase(null)}>Cancelar</Button></div>}
   </section>

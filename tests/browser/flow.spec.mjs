@@ -1,10 +1,10 @@
 import { test, expect } from '@playwright/test'
-import { AREAS } from '../../src/lib/workshop.ts'
+import { AREAS, IDEA_FIELDS, MAX_IDEAS } from '../../src/lib/workshop.ts'
 
 // Dobles de HTTP para probar la UI sin alterar el proyecto Supabase del usuario.
 // RLS y RPC se verifican por separado ejecutando setup.sql en PostgreSQL real.
 function fixture() {
-  const state = { phase: 'waiting', participants: [], ideas: [], choices: [], nextId: 0, failSave: false }
+  const state = { phase: 'waiting', revision: 0, participants: [], ideas: [], choices: [], nextId: 0, failSave: false }
   const users = new Map()
   const moderator = { id: '00000000-0000-4000-8000-000000000100', email: 'moderador@example.test', is_anonymous: false }
   function session(user) {
@@ -23,6 +23,11 @@ function fixture() {
       const mod = user?.id === moderator.id
       const mine = state.participants.find(p => p.user_id === user?.id)
       const respond = (data, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
+      const paginate = rows => {
+        const start = Number(url.searchParams.get('offset') ?? 0)
+        const limit = Math.min(Number(url.searchParams.get('limit') ?? 1000), 1000)
+        return rows.slice(start, start + limit)
+      }
       const failure = message => respond({ message, code: 'P0001', details: null, hint: null }, 400)
       if (url.pathname.endsWith('/signup')) return respond(session({ id: `00000000-0000-4000-8000-${String(++state.nextId).padStart(12, '0')}`, is_anonymous: true }))
       if (url.pathname.endsWith('/token')) return respond(session(body.email === moderator.email ? moderator : { id: 'unprivileged', is_anonymous: false }))
@@ -41,24 +46,25 @@ function fixture() {
         if (endpoint === 'advance_phase') {
           if (!mod) return failure('Se requieren permisos de moderador.')
           state.phase = { waiting: 'ideas', ideas: 'classification', classification: 'results' }[state.phase]
+          state.revision++
           return respond(state.phase)
         }
         if (endpoint === 'classify_idea') {
           if (!mine || state.phase !== 'classification') return failure('La clasificación está cerrada.')
           state.choices = state.choices.filter(c => c.user_id !== user.id || c.idea_id !== body.target_idea)
-          state.choices.push({ user_id: user.id, idea_id: body.target_idea, area_id: body.selected_area })
+          state.choices.push({ user_id: user.id, idea_id: body.target_idea, area_ids: body.selected_areas })
           return respond(null)
         }
-        if (endpoint === 'get_progress') return respond(state.participants.map(p => ({ ...p, completed: state.choices.filter(c => c.user_id === p.user_id).length, total: state.ideas.length })))
-        if (endpoint === 'get_results') return respond(state.ideas.flatMap(i => AREAS.map((_, n) => ({ idea_id: i.id, area_id: n + 1, votes: state.choices.filter(c => c.idea_id === i.id && c.area_id === n + 1).length, total: state.choices.filter(c => c.idea_id === i.id).length }))))
+        if (endpoint === 'get_progress') return respond(paginate(state.participants.map(p => ({ ...p, completed: state.choices.filter(c => c.user_id === p.user_id).length, total: state.ideas.filter(i => !i.preset || ['classification', 'results'].includes(state.phase)).length }))))
+        if (endpoint === 'get_results') return respond(paginate(state.ideas.flatMap(i => AREAS.map((_, n) => ({ idea_id: i.id, area_id: n + 1, votes: state.choices.filter(c => c.idea_id === i.id && c.area_ids.includes(n + 1)).length, total: state.choices.filter(c => c.idea_id === i.id).length, no_area: state.choices.filter(c => c.idea_id === i.id && c.area_ids.length === 0).length })))))
       }
       const single = request.headers().accept?.includes('application/vnd.pgrst.object')
-      const replyRows = rows => respond(single ? rows[0] : rows)
-      if (endpoint === 'workshops') return replyRows([{ id: 1, title: 'Laboratorio de ideas', phase: state.phase }])
+      const replyRows = rows => respond(single ? rows[0] : paginate(rows))
+      if (endpoint === 'workshops') return replyRows([{ id: 1, title: 'Laboratorio de ideas', phase: state.phase, updated_at: `revision-${state.revision}` }])
       if (endpoint === 'participants') return replyRows(state.participants.filter(p => p.user_id === user?.id))
       if (endpoint === 'classifications') return replyRows(state.choices.filter(c => c.user_id === user?.id))
       if (endpoint === 'ideas') {
-        if (method === 'GET') return replyRows(state.ideas.filter(i => mod || (mine && (state.phase !== 'ideas' || i.author_id === user?.id))))
+        if (method === 'GET') return replyRows(state.ideas.filter(i => (!i.preset || ['classification', 'results'].includes(state.phase)) && (mod || (mine && (state.phase !== 'ideas' || i.author_id === user?.id)))))
         if (state.failSave) { state.failSave = false; return failure('Error de conexión de prueba. Volvé a intentar.') }
         if (state.phase !== 'ideas') return failure('La escritura de ideas está cerrada.')
         if (method === 'POST') {
@@ -67,7 +73,7 @@ function fixture() {
         }
         const id = url.searchParams.get('id')?.replace('eq.', '')
         const idea = state.ideas.find(i => i.id === id)
-        if (method === 'PATCH') idea.content = body.content
+        if (method === 'PATCH') Object.assign(idea, body)
         if (method === 'DELETE') state.ideas = state.ideas.filter(i => i.id !== id)
         return replyRows([{ id }])
       }
@@ -77,8 +83,12 @@ function fixture() {
   return { state, attach }
 }
 
+const draftValues = text => ({ position: 'Farmacéutico/a', task: text, information: 'Historia clínica y medicación actual', supervisor: 'Equipo clínico', boundaries: 'No cambiar un tratamiento sin autorización', success_criteria: 'Menos errores de medicación documentados' })
+async function fillIdea(page, text) {
+  for (const { key, label } of IDEA_FIELDS) await page.locator('.idea-composer').getByLabel(label, { exact: true }).fill(draftValues(text)[key])
+}
 async function addIdea(page, text) {
-  await page.getByLabel('¿Qué te gustaría proponer?').fill(text)
+  await fillIdea(page, text)
   await page.getByRole('button', { name: 'Guardar idea' }).click()
   await expect(page.locator('.note-content', { hasText: text })).toBeVisible()
 }
@@ -104,17 +114,21 @@ test('recorrido completo: dos participantes, moderación, recarga y CSV', async 
   await expect(page.getByRole('heading', { name: 'Hola, Lucía.' })).toBeVisible()
   await page.reload()
   await expect(page.getByRole('heading', { name: 'Hola, Lucía.' })).toBeVisible()
-  await second.goto('http://127.0.0.1:5173')
+  await second.goto('http://127.0.0.1:5199')
   await second.getByLabel('Tu nombre').fill('Martín')
   await second.getByRole('button', { name: 'Entrar a la actividad' }).click()
   await expect(second.getByRole('heading', { name: 'Hola, Martín.' })).toBeVisible()
-  await mod.goto('http://127.0.0.1:5173/?moderador')
+  await mod.goto('http://127.0.0.1:5199/?moderador')
   await mod.getByLabel('Correo electrónico').fill('moderador@example.test')
   await mod.getByLabel('Contraseña').fill('test-password-only')
   await mod.getByRole('button', { name: 'Ingresar', exact: true }).click()
   await expect(mod.getByText('El pulso del encuentro')).toBeVisible()
   await advance(mod, 'Comenzar escritura')
   await expect(page.getByRole('heading', { name: 'Tus post-its' })).toBeVisible({ timeout: 10000 })
+  for (const { label, placeholder } of IDEA_FIELDS) {
+    await expect(page.getByLabel(label, { exact: true })).toHaveAttribute('placeholder', placeholder)
+  }
+  await expect(page.getByRole('button', { name: 'Guardar idea' })).toBeDisabled()
   await addIdea(page, 'Un seguimiento más cercano')
   await addIdea(page, 'Una idea para eliminar')
   const removable = page.locator('article', { hasText: 'Una idea para eliminar' })
@@ -123,42 +137,58 @@ test('recorrido completo: dos participantes, moderación, recarga y CSV', async 
   await expect(page.getByText('Una idea para eliminar', { exact: true })).toHaveCount(0)
   const first = page.locator('article').first()
   await first.getByRole('button', { name: 'Editar' }).click()
-  await first.getByLabel('Editar idea').fill('Un seguimiento personalizado')
+  await first.getByLabel('Tarea', { exact: true }).fill('Un seguimiento personalizado')
+  await first.getByLabel('Quién lo supervisa').fill('Comité de farmacia')
   await first.getByRole('button', { name: 'Guardar', exact: true }).click()
   await expect(page.locator('.note-content', { hasText: 'Un seguimiento personalizado' })).toBeVisible()
   await addIdea(page, 'Segunda propuesta')
   await addIdea(page, 'Tercera propuesta')
-  await expect(page.getByLabel('¿Qué te gustaría proponer?')).toHaveCount(0)
+  for (let n = 4; n <= MAX_IDEAS; n++) await addIdea(page, `Propuesta ${n}`)
+  await expect(page.getByText('10 de 10 ideas')).toBeVisible()
+  await expect(page.locator('.idea-composer')).toHaveCount(0)
   await expect(second.getByRole('heading', { name: 'Tus post-its' })).toBeVisible({ timeout: 10000 })
   await addIdea(second, 'Acceso a medicamentos')
   await expect(page.getByText('Acceso a medicamentos', { exact: true })).toHaveCount(0)
   await expect(second.getByText('Un seguimiento personalizado', { exact: true })).toHaveCount(0)
   await addIdea(mod, 'Propuesta del equipo')
   await advance(mod, 'Cerrar escritura')
-  await expect(page.locator('article')).toHaveCount(5, { timeout: 10000 })
+  await expect(page.locator('article')).toHaveCount(12, { timeout: 10000 })
   await expect(page.getByRole('button', { name: 'Editar' })).toHaveCount(0)
-  const choice = page.locator('article', { hasText: 'Un seguimiento personalizado' }).getByRole('combobox')
-  await choice.selectOption('1')
-  await expect(choice).toHaveValue('1')
-  await expect(choice).toBeEnabled()
-  await choice.selectOption('2')
-  await expect(choice).toHaveValue('2')
+  const card = page.locator('article', { hasText: 'Un seguimiento personalizado' })
+  await card.locator('.label-dropzone').scrollIntoViewIfNeeded()
+  const source = page.getByRole('button', { name: `Etiqueta: ${AREAS[0]}`, exact: true })
+  await source.dragTo(card.locator('.label-dropzone'))
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
+  await card.locator('.area-option').filter({ hasText: AREAS[1] }).click()
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[1] })).toHaveAttribute('aria-pressed', 'true')
+  await card.getByRole('button', { name: `Quitar ${AREAS[0]}`, exact: true }).click()
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'false')
   await page.reload()
-  await expect(page.locator('article', { hasText: 'Un seguimiento personalizado' }).getByRole('combobox')).toHaveValue('2')
-  await expect(second.locator('article')).toHaveCount(5, { timeout: 10000 })
-  const otherChoice = second.locator('article', { hasText: 'Un seguimiento personalizado' }).getByRole('combobox')
-  await expect(otherChoice).toHaveValue('')
-  await otherChoice.selectOption('2')
-  await expect(otherChoice).toHaveValue('2')
-  await expect(mod.locator('.participant-details li').filter({ hasText: 'Lucía' })).toContainText('1 / 5', { timeout: 10000 })
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[1] })).toHaveAttribute('aria-pressed', 'true')
+  await card.locator('.area-option').filter({ hasText: AREAS[0] }).focus()
+  await page.keyboard.press('Enter')
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
+  const noAreas = page.locator('article', { hasText: 'Segunda propuesta' })
+  await noAreas.getByRole('button', { name: 'Guardar sin áreas', exact: true }).click()
+  await expect(noAreas.getByText('✓ Respuesta guardada sin áreas')).toBeVisible()
+  await expect(second.locator('article')).toHaveCount(12, { timeout: 10000 })
+  const otherChoice = second.locator('article', { hasText: 'Un seguimiento personalizado' }).locator('.area-option').filter({ hasText: AREAS[1] })
+  await expect(otherChoice).toHaveAttribute('aria-pressed', 'false')
+  await otherChoice.click()
+  await expect(otherChoice).toHaveAttribute('aria-pressed', 'true')
+  await expect(mod.locator('.participant-details li').filter({ hasText: 'Lucía' })).toContainText('2 / 12', { timeout: 10000 })
   await expect(mod.getByRole('combobox')).toHaveCount(0)
   await advance(mod, 'Mostrar resultados')
-  await expect(page.locator('.results-list')).toHaveCount(5, { timeout: 10000 })
+  await expect(page.locator('.results-list')).toHaveCount(12, { timeout: 10000 })
   const result = page.locator('article', { hasText: 'Un seguimiento personalizado' })
-  await expect(result.locator('.results-list li')).toHaveCount(7)
+  await expect(result.locator('.results-list li')).toHaveCount(6)
   await expect(result.locator('.results-list li').filter({ hasText: 'Farmacovigilancia' }).locator('b')).toHaveText('2')
-  await expect(result.locator('.results-list li').filter({ hasText: 'Individualización' }).locator('b')).toHaveText('0')
+  await expect(result.locator('.results-list li').filter({ hasText: 'Individualización' }).locator('b')).toHaveText('1')
   await expect(result.locator('.result-total strong')).toHaveText('2')
+  await expect(result.getByText('Comité de farmacia', { exact: true })).toBeVisible()
+  await expect(result.locator('.idea-details dt')).toHaveCount(6)
+  await expect(page.locator('article', { hasText: 'Segunda propuesta' }).locator('.result-none strong')).toHaveText('1')
+  await expect(page.getByText('Transversal / no estoy seguro', { exact: true })).toHaveCount(0)
   await expect(page.getByRole('combobox')).toHaveCount(0)
   const csvEvent = mod.waitForEvent('download')
   await mod.getByRole('button', { name: 'Resultados CSV' }).click()
@@ -170,15 +200,19 @@ test('recorrido completo: dos participantes, moderación, recarga y CSV', async 
   const csv = Buffer.concat(chunks).toString('utf8')
   expect(csv).toContain('Equipo organizador')
   expect(csv).toContain('Total de respuestas')
+  for (const { label } of IDEA_FIELDS) expect(csv).toContain(label)
+  expect(csv).toContain('Comité de farmacia')
+  expect(csv).toContain('Sin áreas')
+  expect(csv).not.toContain('Transversal')
   await page.reload()
-  await expect(page.locator('.results-list')).toHaveCount(5)
+  await expect(page.locator('.results-list')).toHaveCount(12)
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('resultados.png'), fullPage: true })
   await moderatorContext.close()
   await secondContext.close()
 })
 
-test('errores al guardar conservan el texto y permiten reintentar', async ({ page }) => {
+test('errores al guardar conservan el texto y permiten reintentar', async ({ page }, testInfo) => {
   const api = fixture()
   await api.attach(page.context())
   await page.goto('/')
@@ -187,12 +221,14 @@ test('errores al guardar conservan el texto y permiten reintentar', async ({ pag
   await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
   api.state.phase = 'ideas'
   await page.reload()
-  await expect(page.getByLabel('¿Qué te gustaría proponer?')).toBeVisible()
+  await expect(page.getByLabel('Tarea', { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  await page.locator('.idea-composer').screenshot({ path: testInfo.outputPath('formulario.png') })
   api.state.failSave = true
-  await page.getByLabel('¿Qué te gustaría proponer?').fill('Esta idea debe conservarse')
+  await fillIdea(page, 'Esta idea debe conservarse')
   await page.getByRole('button', { name: 'Guardar idea' }).click()
   await expect(page.getByRole('alert')).toContainText('Error de conexión de prueba')
-  await expect(page.getByLabel('¿Qué te gustaría proponer?')).toHaveValue('Esta idea debe conservarse')
+  for (const { key, label } of IDEA_FIELDS) await expect(page.getByLabel(label, { exact: true })).toHaveValue(draftValues('Esta idea debe conservarse')[key])
   await page.getByRole('button', { name: 'Guardar idea' }).click()
   await expect(page.locator('.note-content')).toHaveText('Esta idea debe conservarse')
 })
@@ -211,4 +247,187 @@ test('una cuenta sin permisos no reemplaza la sesión del participante', async (
   await expect(page.getByRole('alert')).toContainText('no tiene permisos')
   await page.getByRole('button', { name: 'Volver a la actividad' }).click()
   await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
+})
+
+test('resultados paginados: más de 1.000 filas y actualización después de reiniciar', async ({ page }) => {
+  const api = fixture()
+  await api.attach(page.context())
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Ana')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
+  const userId = api.state.participants[0].user_id
+  api.state.ideas = Array.from({ length: 180 }, (_, n) => ({
+    ...draftValues(`Tarea ${n + 1}`), id: `large-idea-${n + 1}`, author_id: userId,
+    organizer: false, created_at: new Date().toISOString(),
+  }))
+  api.state.choices = [{ user_id: userId, idea_id: 'large-idea-180', area_ids: [6] }]
+  api.state.phase = 'results'
+  api.state.revision++
+  await page.reload()
+  await expect(page.locator('.results-list')).toHaveCount(180)
+  const last = page.locator('article').last()
+  await expect(last.locator('.results-list li').filter({ hasText: 'Información de medicamentos' }).locator('b')).toHaveText('1')
+  await expect(last.locator('.result-total strong')).toHaveText('1')
+  // La caché de un mural cerrado se invalida al cambiar la revisión de fase.
+  api.state.phase = 'waiting'
+  api.state.revision++
+  api.state.ideas = []
+  api.state.choices = []
+  api.state.participants = []
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByLabel('Tu nombre')).toBeVisible()
+  await expect(page.locator('article')).toHaveCount(0)
+})
+
+test('solo Tarea obligatoria: crear, editar, recargar y leer con letra grande', async ({ page }, testInfo) => {
+  const api = fixture()
+  await api.attach(page.context())
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Ana')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
+  api.state.phase = 'ideas'
+  await page.reload()
+  await page.getByLabel('Tarea', { exact: true }).fill('Revisar las interacciones de la medicación')
+  for (const { key, label } of IDEA_FIELDS) {
+    if (key !== 'task') {
+      await expect(page.getByLabel(label, { exact: true })).not.toHaveAttribute('required', '')
+      await expect(page.getByLabel(label, { exact: true })).toHaveValue('')
+    }
+  }
+  await expect(page.getByRole('button', { name: 'Guardar idea' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Guardar idea' }).click()
+  await expect(page.locator('article .note-content')).toHaveText('Revisar las interacciones de la medicación')
+  await expect(page.locator('article .idea-details dt')).toHaveCount(1)
+  await page.reload()
+  await expect(page.locator('article .note-content')).toHaveText('Revisar las interacciones de la medicación')
+  const size = await page.locator('article .note-content').evaluate(node => parseFloat(getComputedStyle(node).fontSize))
+  expect(size).toBeGreaterThanOrEqual(22)
+  await page.locator('article').getByRole('button', { name: 'Editar', exact: true }).click()
+  await page.locator('article').getByLabel('Tarea', { exact: true }).fill('Tarea actualizada')
+  await page.locator('article').getByRole('button', { name: 'Guardar', exact: true }).click()
+  await expect(page.locator('article .note-content')).toHaveText('Tarea actualizada')
+  await page.locator('article').screenshot({ path: testInfo.outputPath('idea-legible.png') })
+})
+
+test('arrastre con mouse y pantalla táctil, etiquetas por toque y quitar la última', async ({ page }, testInfo) => {
+  const api = fixture()
+  await api.attach(page.context())
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Ana')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
+  api.state.ideas = [{ ...draftValues('Una tarea para conectar'), id: 'drag-idea', author_id: api.state.participants[0].user_id, organizer: false, created_at: new Date().toISOString() }]
+  api.state.phase = 'classification'
+  api.state.revision++
+  await page.reload()
+  const card = page.locator('article')
+  const target = card.locator('.label-dropzone')
+  await target.scrollIntoViewIfNeeded()
+  const label = page.getByRole('button', { name: `Etiqueta: ${AREAS[0]}`, exact: true })
+  if (testInfo.project.use.hasTouch) {
+    const start = await label.boundingBox()
+    const end = await target.boundingBox()
+    const from = { x: start.x + start.width / 2, y: start.y + start.height / 2 }
+    const to = { x: end.x + end.width / 2, y: end.y + end.height / 2 }
+    const cdp = await page.context().newCDPSession(page)
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [from] })
+    for (let step = 1; step <= 8; step++) await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: from.x + (to.x - from.x) * step / 8, y: from.y + (to.y - from.y) * step / 8 }] })
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    await cdp.detach()
+  } else await label.dragTo(target)
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
+  const next = page.getByRole('button', { name: `Etiqueta: ${AREAS[1]}`, exact: true })
+  if (testInfo.project.use.hasTouch) await next.tap()
+  else await next.click()
+  await expect(next).toHaveAttribute('aria-pressed', 'true')
+  if (testInfo.project.use.hasTouch) await card.locator('.drop-hint').tap()
+  else await card.locator('.drop-hint').click()
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[1] })).toHaveAttribute('aria-pressed', 'true')
+  await card.screenshot({ path: testInfo.outputPath('clasificacion.png') })
+  await card.getByRole('button', { name: `Quitar ${AREAS[0]}`, exact: true }).click()
+  await expect(card.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'false')
+  await card.getByRole('button', { name: `Quitar ${AREAS[1]}`, exact: true }).click()
+  await expect(card.getByText('✓ Respuesta guardada sin áreas')).toBeVisible()
+  await page.reload()
+  await expect(page.getByText('✓ Respuesta guardada sin áreas')).toBeVisible()
+})
+
+test('ideas predeterminadas: aparecen al clasificar, muestran resultados y sobreviven al reinicio', async ({ page, browser }, testInfo) => {
+  const api = fixture()
+  const titles = [
+    'Asistente para revisar combinaciones de medicamentos',
+    'Asistente para detectar posibles problemas con medicamentos',
+    'Asistente para explicar el uso de medicamentos',
+  ]
+  const presets = titles.map((title, index) => ({
+    ...draftValues(`Tareas de ejemplo ${index + 1}`), title,
+    id: `ce1def00-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+    preset: true, organizer: true, author_id: null, created_at: '2026-10-11T00:00:00.000Z',
+  }))
+  api.state.ideas = [...presets]
+  await api.attach(page.context())
+  const moderatorContext = await browser.newContext({ viewport: testInfo.project.use.viewport })
+  await api.attach(moderatorContext)
+  const mod = await moderatorContext.newPage()
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Ana')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Hola, Ana.' })).toBeVisible()
+  await mod.goto('http://127.0.0.1:5199/?moderador')
+  await mod.getByLabel('Correo electrónico').fill('moderador@example.test')
+  await mod.getByLabel('Contraseña').fill('test-password-only')
+  await mod.getByRole('button', { name: 'Ingresar', exact: true }).click()
+  await expect(mod.getByText('El pulso del encuentro')).toBeVisible()
+  await advance(mod, 'Comenzar escritura')
+  await expect(page.locator('.idea-composer')).toBeVisible({ timeout: 10000 })
+  for (const title of titles) {
+    await expect(page.getByRole('heading', { name: title, exact: true })).toHaveCount(0)
+    await expect(mod.getByRole('heading', { name: title, exact: true })).toHaveCount(0)
+  }
+  await addIdea(page, 'Idea que sí se borra al reiniciar')
+  await advance(mod, 'Cerrar escritura')
+  await expect(page.locator('article')).toHaveCount(4, { timeout: 10000 })
+  for (const title of titles) await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible()
+  const first = page.locator('article', { hasText: titles[0] })
+  await expect(first.getByRole('button', { name: 'Editar', exact: true })).toHaveCount(0)
+  await expect(first.getByText('Idea predeterminada · Equipo organizador')).toBeVisible()
+  await first.locator('.area-option').filter({ hasText: AREAS[0] }).click()
+  await expect(first.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
+  await page.locator('article', { hasText: titles[1] }).getByRole('button', { name: 'Guardar sin áreas', exact: true }).click()
+  await page.reload()
+  await expect(first.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
+  await advance(mod, 'Mostrar resultados')
+  await expect(page.locator('.results-list')).toHaveCount(4, { timeout: 10000 })
+  await expect(first.locator('.results-list li').filter({ hasText: AREAS[0] }).locator('b')).toHaveText('1')
+  await expect(page.locator('article', { hasText: titles[1] }).locator('.result-none strong')).toHaveText('1')
+  await expect(first.locator('.result-total strong')).toHaveText('1')
+  const downloadEvent = mod.waitForEvent('download')
+  await mod.getByRole('button', { name: 'Resultados CSV' }).click()
+  const stream = await (await downloadEvent).createReadStream()
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  const csv = Buffer.concat(chunks).toString('utf8')
+  for (const title of titles) expect(csv).toContain(title)
+  expect(csv).toContain('Título')
+  // Simular el reset administrativo; las tres filas siguen siendo las mismas.
+  api.state.ideas = api.state.ideas.filter(idea => idea.preset)
+  api.state.choices = []; api.state.participants = []; api.state.phase = 'waiting'; api.state.revision++
+  expect(api.state.ideas).toEqual(presets)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await mod.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByLabel('Tu nombre')).toBeVisible()
+  await expect(mod.getByRole('button', { name: 'Comenzar escritura', exact: true })).toBeVisible()
+  await page.getByLabel('Tu nombre').fill('Ana en otra edición')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Hola, Ana en otra edición.' })).toBeVisible()
+  await advance(mod, 'Comenzar escritura')
+  await expect(page.locator('.idea-composer')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('article')).toHaveCount(0)
+  await advance(mod, 'Cerrar escritura')
+  await expect(page.locator('article')).toHaveCount(3, { timeout: 10000 })
+  for (const title of titles) await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible()
+  await expect(page.getByText('0 de 3 ideas clasificadas', { exact: true })).toBeVisible()
+  await moderatorContext.close()
 })

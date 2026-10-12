@@ -11,16 +11,18 @@ export function useWorkshop(session: Session | null) {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
   const [live, setLive] = useState(false)
   const version = useRef(0)
+  const cache = useRef<{ userId: string; snapshot: Snapshot } | null>(null)
   const refresh = useCallback(async (userId?: string) => {
     const id = userId ?? session?.user.id
     if (!id) return
     const request = ++version.current
     try {
-      const snapshot = await loadSnapshot(id)
+      const snapshot = await loadSnapshot(id, cache.current?.userId === id ? cache.current.snapshot : undefined)
       if (request !== version.current) return
-      setData({ userId: id, snapshot })
+      cache.current = { userId: id, snapshot }
+      setData(current => current?.userId === id && current.snapshot === snapshot ? current : { userId: id, snapshot })
       setError('')
-      setUpdatedAt(new Date())
+      setUpdatedAt(current => current ?? new Date())
     } catch (cause) {
       if (request === version.current) setError(errorMessage(cause))
     }

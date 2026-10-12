@@ -1,7 +1,9 @@
 -- CEIDEF: reinicio manual, ejecutar completo desde el SQL Editor como postgres.
--- ATENCIÓN: borra definitivamente participantes, ideas y clasificaciones,
--- incluidas las ideas del equipo organizador. Exportá los CSV antes.
+-- ATENCIÓN: borra participantes, ideas de usuarios/organizadores y clasificaciones.
+-- Exportá los CSV antes. Conserva las tres ideas predeterminadas y sus UUIDs,
+-- pero borra sus respuestas para que cada encuentro comience sin votos.
 -- Conserva usuarios de Auth, permisos de moderación, áreas, RLS y funciones.
+-- Requiere la migración 20261011_preset_ideas.sql (o el setup.sql actualizado).
 -- No ejecutar setup.sql nuevamente para reiniciar.
 
 begin;
@@ -13,10 +15,11 @@ begin;
 lock table public.workshops, public.participants, public.ideas, public.classifications
   in access exclusive mode nowait;
 
--- Las tres tablas se vacían juntas para respetar sus claves foráneas.
--- Sin CASCADE: no se borran otras tablas. TRUNCATE no dispara guard_idea,
--- que impide DELETE fuera de la fase de escritura o sobre ideas ajenas.
-truncate table public.classifications, public.ideas, public.participants;
+-- Vaciar las respuestas y participantes juntos respeta las claves foráneas.
+-- El trigger permite este DELETE administrativo como postgres, sin JWT.
+-- Las ideas predeterminadas permanecen intactas y quedan ocultas en Espera.
+truncate table public.classifications, public.participants;
+delete from public.ideas where not preset;
 
 update public.workshops
 set phase = 'waiting', updated_at = now()
