@@ -79,7 +79,7 @@ test('SQL real: fases, límites, RPC y privacidad con roles y JWT', async t => {
     await denied(uid(1), 'select * from public.get_results()')
     await as(moderator, "select public.advance_phase('waiting')")
     await denied(moderator, "select public.advance_phase('waiting')", [], /fase cambió/)
-    await denied(uid(102), "select public.join_workshop('Tarde')", [], /ingreso cerró/)
+    await denied(uid(102), "select public.join_workshop('Tarde')", [], /100 participantes/)
     await as(uid(1), "select public.join_workshop('Recarga')")
   })
   await t.test('ideas privadas, máximo 10, edición y eliminación propias', async () => {

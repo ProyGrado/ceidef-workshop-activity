@@ -177,6 +177,14 @@ h1 { font-size: clamp(35px, 4.7vw, 58px); line-height: 1.06; margin-bottom: 22px
 .phase-confirm > div { flex: 1 1 300px; }
 .phase-confirm strong { font-size: 14px; }
 .phase-confirm p { font-size: 12px; color: #654c40; margin: 7px 0 0; }
+.danger-button { background: var(--terracotta); color: white; margin-top: 15px; }
+.reset-dialog { width: min(520px, calc(100% - 40px)); max-height: calc(100svh - 40px); overflow: auto; padding: 28px; border: 1px solid var(--line); border-radius: 12px; background: var(--cream); color: var(--graphite); }
+.reset-dialog::backdrop { background: rgb(37 42 45 / 55%); }
+.reset-dialog h2 { font-size: 24px; margin-bottom: 18px; }
+.reset-dialog p { font-size: 15px; line-height: 1.6; margin-bottom: 15px; }
+.reset-dialog .reset-error { color: #9c3024; }
+.reset-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 22px; }
+.reset-actions .danger-button { margin-top: 0; }
 .empty-state { text-align: center; color: var(--muted); }
 footer { border-top: 1px solid var(--line); padding: 23px 0; display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 11px; color: var(--muted); }
 .footer-separator { margin-inline: 10px; color: #acb1a4; }

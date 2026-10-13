@@ -38,7 +38,8 @@ function fixture() {
         if (endpoint === 'is_moderator') return respond(mod)
         if (endpoint === 'join_workshop') {
           if (mine) return respond(mine)
-          if (state.phase !== 'waiting') return failure('El ingreso cerró.')
+          if (mod) return failure('El moderador no ocupa un lugar de participante.')
+          if (state.participants.length >= 100) return failure('La actividad ya tiene 100 participantes.')
           const participant = { user_id: user.id, name: body.participant_name }
           state.participants.push(participant)
           return respond(participant)
@@ -48,6 +49,15 @@ function fixture() {
           state.phase = { waiting: 'ideas', ideas: 'classification', classification: 'results' }[state.phase]
           state.revision++
           return respond(state.phase)
+        }
+        if (endpoint === 'reset_workshop') {
+          if (!mod) return failure('Se requieren permisos de moderador.')
+          if (body.expected_revision !== `revision-${state.revision}`) return failure('La actividad cambió. Cerrá la confirmación y revisá antes de reiniciar.')
+          if (state.failReset) { state.failReset = false; return failure('No se pudo reiniciar. Volvé a intentar.') }
+          state.participants = []; state.choices = []
+          state.ideas = state.ideas.filter(idea => idea.preset)
+          state.phase = 'waiting'; state.revision++
+          return respond(null)
         }
         if (endpoint === 'classify_idea') {
           if (!mine || state.phase !== 'classification') return failure('La clasificación está cerrada.')
@@ -84,6 +94,149 @@ function fixture() {
 }
 
 const draftValues = text => ({ position: 'Farmacéutico/a', task: text, information: 'Historia clínica y medicación actual', supervisor: 'Equipo clínico', boundaries: 'No cambiar un tratamiento sin autorización', success_criteria: 'Menos errores de medicación documentados' })
+
+for (const phase of ['ideas', 'classification', 'results']) {
+  test(`ingreso tardío en ${phase}, recarga y otro dispositivo sin actividad previa`, async ({ page, browser }, testInfo) => {
+    const api = fixture()
+    api.state.phase = phase
+    const original = '00000000-0000-4000-8000-000000000090'
+    api.state.participants.push({ user_id: original, name: 'Original' })
+    api.state.ideas.push({ ...draftValues('Idea existente'), id: 'existing-idea', author_id: original, organizer: false, created_at: new Date().toISOString() })
+    api.state.choices.push({ user_id: original, idea_id: 'existing-idea', area_ids: [1] })
+    await api.attach(page.context())
+    await page.goto('/')
+    await page.getByLabel('Tu nombre').fill('Ingreso tardío')
+    await expect(page.getByRole('button', { name: 'Entrar a la actividad' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+    const heading = phase === 'ideas' ? 'Tus post-its' : 'Nuestro mural de ideas'
+    await expect(page.getByRole('heading', { name: heading })).toBeVisible()
+    expect(api.state.phase).toBe(phase)
+    if (phase === 'ideas') {
+      await expect(page.getByText('Idea existente', { exact: true })).toHaveCount(0)
+      await addIdea(page, 'Idea desde ingreso tardío')
+    } else {
+      await expect(page.locator('.idea-composer')).toHaveCount(0)
+      await expect(page.getByText('Idea existente', { exact: true })).toBeVisible()
+      if (phase === 'classification') {
+        await expect(page.getByText('0 de 1 ideas clasificadas')).toBeVisible()
+        await page.locator('.area-option').filter({ hasText: AREAS[1] }).click()
+        await expect(page.getByText('1 de 1 ideas clasificadas')).toBeVisible()
+      } else {
+        await expect(page.locator('.result-total')).toContainText('1')
+        await expect(page.locator('.area-option')).toHaveCount(0)
+      }
+    }
+    await page.reload()
+    await expect(page.getByRole('heading', { name: heading })).toBeVisible()
+    expect(api.state.participants).toHaveLength(2)
+    if (phase === 'classification') await expect(page.getByText('1 de 1 ideas clasificadas')).toBeVisible()
+    // Otro navegador no hereda las ideas ni las elecciones de una sesión anónima.
+    const other = await browser.newContext({ viewport: testInfo.project.use.viewport })
+    try {
+      await api.attach(other)
+      const next = await other.newPage()
+      await next.goto('http://127.0.0.1:5199')
+      await next.getByLabel('Tu nombre').fill('Ingreso tardío')
+      await next.getByRole('button', { name: 'Entrar a la actividad' }).click()
+      await expect(next.getByRole('heading', { name: heading })).toBeVisible()
+      expect(api.state.participants).toHaveLength(3)
+      expect(api.state.participants[1].user_id).not.toBe(api.state.participants[2].user_id)
+      if (phase === 'ideas') await expect(next.locator('article')).toHaveCount(0)
+      if (phase === 'classification') await expect(next.getByText('0 de 1 ideas clasificadas')).toBeVisible()
+      if (phase === 'results') await expect(next.locator('.result-total')).toContainText('1')
+      await next.screenshot({ path: testInfo.outputPath(`ingreso-${phase}.png`), fullPage: true })
+    } finally { await other.close() }
+  })
+}
+
+test('moderación actualiza los participantes que ingresan en resultados', async ({ page, browser }, testInfo) => {
+  const api = fixture()
+  api.state.phase = 'results'
+  api.state.participants.push({ user_id: 'original', name: 'Original' })
+  api.state.ideas.push({ ...draftValues('Idea existente'), id: 'existing', author_id: 'original', organizer: false, created_at: new Date().toISOString() })
+  await api.attach(page.context())
+  await page.goto('/?moderador')
+  await page.getByLabel('Correo electrónico').fill('moderador@example.test')
+  await page.getByLabel('Contraseña').fill('test-password-only')
+  await page.getByRole('button', { name: 'Ingresar', exact: true }).click()
+  await expect(page.getByText('Participantes y progreso (1)', { exact: true })).toBeVisible()
+  const other = await browser.newContext({ viewport: testInfo.project.use.viewport })
+  try {
+    await api.attach(other)
+    const next = await other.newPage()
+    await next.goto('http://127.0.0.1:5199')
+    await next.getByLabel('Tu nombre').fill('Recién llegado')
+    await next.getByRole('button', { name: 'Entrar a la actividad' }).click()
+    await expect(next.getByRole('heading', { name: 'Nuestro mural de ideas' })).toBeVisible()
+    await expect(page.getByText('Participantes y progreso (2)', { exact: true })).toBeVisible({ timeout: 10000 })
+    await page.locator('.participant-details summary').click()
+    await expect(page.locator('.participant-details li').filter({ hasText: 'Recién llegado' })).toContainText('0 / 1')
+    await page.screenshot({ path: testInfo.outputPath('moderacion-ingreso-resultados.png'), fullPage: true })
+  } finally { await other.close() }
+})
+
+test('reinicio solo de moderación: popup, cancelar, error, reintentar y conservar predeterminadas', async ({ page, browser }, testInfo) => {
+  const api = fixture()
+  api.state.phase = 'results'
+  api.state.participants = [{ user_id: 'original', name: 'Original' }]
+  api.state.ideas = [
+    { ...draftValues('Idea que se borra'), id: 'normal', author_id: 'original', organizer: false },
+    ...[1, 2, 3].map(n => ({ ...draftValues(`Tarea permanente ${n}`), id: `preset-${n}`, author_id: null, organizer: true, preset: true, title: `Predeterminada ${n}` })),
+  ]
+  api.state.choices = [{ user_id: 'original', idea_id: 'normal', area_ids: [1] }]
+  await api.attach(page.context())
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Participante')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Nuestro mural de ideas' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reiniciar actividad', exact: true })).toHaveCount(0)
+  const context = await browser.newContext({ viewport: testInfo.project.use.viewport })
+  try {
+    await api.attach(context)
+    const mod = await context.newPage()
+    await mod.goto('http://127.0.0.1:5199/?moderador')
+    await mod.getByLabel('Correo electrónico').fill('moderador@example.test')
+    await mod.getByLabel('Contraseña').fill('test-password-only')
+    await mod.getByRole('button', { name: 'Ingresar', exact: true }).click()
+    const reset = mod.getByRole('button', { name: 'Reiniciar actividad', exact: true })
+    const popup = mod.getByRole('dialog', { name: '¿Reiniciar la actividad?' })
+    await reset.click()
+    await expect(popup).toBeVisible()
+    await expect(popup.getByRole('button', { name: 'Cancelar', exact: true })).toBeFocused()
+    await popup.getByRole('button', { name: 'Cancelar', exact: true }).click()
+    await expect(popup).toHaveCount(0)
+    expect(api.state.phase).toBe('results')
+    expect(api.state.ideas).toHaveLength(4)
+    await reset.click()
+    await mod.keyboard.press('Escape')
+    await expect(popup).toHaveCount(0)
+    await expect(reset).toBeFocused()
+    await reset.click()
+    api.state.failReset = true
+    await popup.getByRole('button', { name: 'Sí, reiniciar actividad' }).click()
+    await expect(popup.getByRole('alert')).toContainText('No se pudo reiniciar')
+    expect(api.state.ideas).toHaveLength(4)
+    await popup.screenshot({ path: testInfo.outputPath('confirmacion-reinicio.png') })
+    await popup.getByRole('button', { name: 'Sí, reiniciar actividad' }).click()
+    await expect(popup).toHaveCount(0)
+    await expect(mod.getByRole('heading', { name: 'Todo listo para empezar.' })).toBeVisible()
+    expect(api.state.participants).toHaveLength(0)
+    expect(api.state.choices).toHaveLength(0)
+    expect(api.state.ideas).toHaveLength(3)
+    await expect(page.getByLabel('Tu nombre')).toBeVisible({ timeout: 10000 })
+    await page.getByLabel('Tu nombre').fill('Nueva edición')
+    await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+    await expect(page.getByRole('heading', { name: 'Hola, Nueva edición.' })).toBeVisible()
+    await advance(mod, 'Comenzar escritura')
+    await expect(mod.locator('article')).toHaveCount(0)
+    await advance(mod, 'Cerrar escritura')
+    await expect(page.locator('article')).toHaveCount(3, { timeout: 10000 })
+    await page.reload()
+    await expect(page.locator('article')).toHaveCount(3)
+    await expect(page.getByText('0 de 3 ideas clasificadas')).toBeVisible()
+  } finally { await context.close() }
+})
+
 async function fillIdea(page, text) {
   for (const { key, label } of IDEA_FIELDS) await page.locator('.idea-composer').getByLabel(label, { exact: true }).fill(draftValues(text)[key])
 }

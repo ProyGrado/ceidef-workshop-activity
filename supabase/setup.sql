@@ -5,6 +5,14 @@ begin;
 create schema if not exists ceidef_private;
 revoke all on schema ceidef_private from public, anon, authenticated;
 
+-- Contexto de autorización efímero, inaccesible desde los roles de la API.
+create table ceidef_private.reset_context (
+  transaction_id xid8 primary key,
+  moderator_id uuid not null
+);
+alter table ceidef_private.reset_context enable row level security;
+revoke all on ceidef_private.reset_context from public, anon, authenticated;
+
 create table public.workshops (
   id smallint primary key check (id = 1),
   title text not null default 'Laboratorio de ideas',
@@ -147,6 +155,14 @@ begin
     if TG_OP = 'INSERT' and NEW.preset then return NEW; end if;
     if TG_OP = 'DELETE' and not OLD.preset then return OLD; end if;
   end if;
+  -- Excepción acotada al reinicio autorizado: no permite borrar predeterminadas.
+  if TG_OP = 'DELETE' and not OLD.preset
+    and public.is_moderator() and exists (
+      select 1 from ceidef_private.reset_context c
+      where c.transaction_id = pg_current_xact_id() and c.moderator_id = auth.uid()
+    ) then
+    return OLD;
+  end if;
   if TG_OP = 'DELETE' then
     if OLD.preset then raise exception 'Las ideas predeterminadas son permanentes.'; end if;
   else
@@ -232,15 +248,14 @@ $$;
 
 create function public.join_workshop(participant_name text) returns public.participants
 language plpgsql security definer set search_path = '' as $$
-declare existing public.participants; current_phase text;
+declare existing public.participants;
 begin
   if auth.uid() is null then raise exception 'Iniciá una sesión para ingresar.'; end if;
   if public.is_moderator() then raise exception 'El moderador no ocupa un lugar de participante.'; end if;
   -- Lock exclusivo para que dos ingresos no excedan juntos los 100 lugares.
-  select phase into current_phase from public.workshops where id = 1 for update;
+  perform 1 from public.workshops where id = 1 for update;
   select * into existing from public.participants where user_id = auth.uid();
   if found then return existing; end if;
-  if current_phase <> 'waiting' then raise exception 'El ingreso cerró cuando comenzó la actividad.'; end if;
   if (select count(*) from public.participants) >= 100 then raise exception 'La actividad ya tiene 100 participantes.'; end if;
   if participant_name is null or length(btrim(participant_name)) not between 1 and 60 then
     raise exception 'Ingresá un nombre de entre 1 y 60 caracteres.';
@@ -300,6 +315,33 @@ grant usage on schema ceidef_private to authenticated;
 grant execute on function ceidef_private.is_participant(), ceidef_private.phase() to authenticated;
 
 -- Publicar solamente la fase. Las ideas y votos privados NO van a Realtime.
+-- BEGIN MODERATOR RESET
+create function public.reset_workshop(expected_revision timestamptz) returns void
+language plpgsql security definer set search_path = '' as $$
+declare revision timestamptz;
+begin
+  if not public.is_moderator() then raise exception 'Se requieren permisos de moderador.'; end if;
+  -- Mismo orden de locks que reset.sql. Ante actividad concurrente, abortar todo.
+  lock table public.workshops, public.participants, public.ideas, public.classifications
+    in access exclusive mode nowait;
+  select updated_at into revision from public.workshops where id = 1;
+  if not found or revision is distinct from expected_revision then
+    raise exception 'La actividad cambió. Cerrá la confirmación y revisá antes de reiniciar.';
+  end if;
+  insert into ceidef_private.reset_context(transaction_id, moderator_id)
+    values (pg_current_xact_id(), auth.uid());
+  truncate table public.classifications, public.participants;
+  delete from public.ideas where not preset;
+  update public.workshops set phase = 'waiting', updated_at = clock_timestamp() where id = 1;
+  delete from ceidef_private.reset_context where transaction_id = pg_current_xact_id();
+exception when lock_not_available then
+  raise exception 'Hay una operación en curso. Esperá unos segundos y volvé a intentar.';
+end;
+$$;
+revoke all on function public.reset_workshop(timestamptz) from public, anon, authenticated;
+grant execute on function public.reset_workshop(timestamptz) to authenticated;
+-- END MODERATOR RESET
+
 -- El cliente relee datos con RLS cada 5 s y al recuperar foco/conexión.
 do $$
 begin

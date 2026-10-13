@@ -19,12 +19,14 @@ export async function loadSnapshot(userId: string, previous?: Snapshot): Promise
     && previous?.moderator === moderator && previous?.participant?.user_id === participant?.user_id
   // Con resultados cerrados no hay más escrituras: se conserva el mural.
   // La fase y los permisos se siguen consultando, también tras un reinicio.
-  if (samePhase && workshop.phase === 'results') return previous!
+  // El moderador sigue consultando el padrón: también hay ingresos en resultados.
+  if (samePhase && workshop.phase === 'results' && !moderator) return previous!
   const [ideas, choices, results, progress] = await Promise.all([
-    samePhase && workshop.phase === 'classification' ? Promise.resolve(previous!.ideas) :
+    samePhase && (workshop.phase === 'classification' || workshop.phase === 'results') ? Promise.resolve(previous!.ideas) :
       fetchAll<Idea>((from, to) => supabase!.from('ideas').select(`id,author_id,${IDEA_FIELDS.map(f => f.key).join(',')},organizer,preset,title,created_at`).order('created_at').order('id').range(from, to)),
     participant ? fetchAll<Choice>((from, to) => supabase!.from('classifications').select('idea_id,area_ids').eq('user_id', userId).order('idea_id').range(from, to)) : Promise.resolve([]),
-    workshop.phase === 'results' ? fetchAll<Result>((from, to) => supabase!.rpc('get_results').range(from, to)) : Promise.resolve([]),
+    workshop.phase === 'results' ? samePhase ? Promise.resolve(previous!.results) :
+      fetchAll<Result>((from, to) => supabase!.rpc('get_results').range(from, to)) : Promise.resolve([]),
     moderator ? fetchAll<Progress>((from, to) => supabase!.rpc('get_progress').range(from, to)) : Promise.resolve([]),
   ])
   return { workshop, moderator, participant, ideas, choices, results, progress }
