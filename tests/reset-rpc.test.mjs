@@ -47,6 +47,7 @@ for (const migrated of [false, true]) {
       const idea = (await as(user, 'insert into public.ideas(author_id,task) values ($1,$2) returning id', [user, 'Idea participante'])).rows[0].id
       await as(moderator, 'insert into public.ideas(author_id,task,organizer) values ($1,$2,true)', [moderator, 'Idea organizador'])
       await as(moderator, "select public.advance_phase('ideas')")
+    if (!migrated) await as(moderator, "select public.advance_phase('review')")
       await as(user, 'select public.classify_idea($1,array[1]::smallint[])', [idea])
       await as(user, "select public.classify_idea($1,'{}'::smallint[])", ['ce1def00-0000-4000-8000-000000000001'])
       await as(moderator, "select public.advance_phase('classification')")
@@ -87,7 +88,7 @@ for (const migrated of [false, true]) {
     await db.exec('drop trigger fail_reset on public.ideas; drop function public.fail_reset()')
     await as(moderator, 'select public.reset_workshop($1)', [expected])
     await assert.rejects(as(moderator, 'select public.reset_workshop($1)', [expected]), /cambió/)
-    for (const phase of ['waiting', 'ideas', 'classification', 'results']) {
+    for (const phase of (migrated ? ['waiting', 'ideas', 'classification', 'results'] : ['waiting', 'ideas', 'review', 'classification', 'results'])) {
       const oldIdea = await seed()
       await db.query('update public.workshops set phase=$1,updated_at=clock_timestamp()', [phase])
       await as(moderator, 'select public.reset_workshop($1)', [await revision()])

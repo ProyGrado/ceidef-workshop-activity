@@ -35,6 +35,7 @@ for (const migrated of [false, true]) {
     await as(moderator, "select public.advance_phase('waiting')")
     const idea = (await as(uid(1), 'insert into public.ideas(author_id,task) values ($1,$2) returning id', [uid(1), 'Idea anterior'])).rows[0].id
     await as(moderator, "select public.advance_phase('ideas')")
+    if (!migrated) await as(moderator, "select public.advance_phase('review')")
     await as(uid(1), 'select public.classify_idea($1,array[1]::smallint[])', [idea])
     await as(moderator, "select public.advance_phase('classification')")
     const before = (await db.query('select * from public.workshops')).rows
@@ -51,14 +52,14 @@ for (const migrated of [false, true]) {
     }
     // Volver a espera solo para recorrer las cuatro fases con los mismos datos.
     await db.exec("update public.workshops set phase='waiting'")
-    for (const [index, phase] of ['waiting', 'ideas', 'classification', 'results'].entries()) {
+    for (const [index, phase] of (migrated ? ['waiting', 'ideas', 'classification', 'results'] : ['waiting', 'ideas', 'review', 'classification', 'results']).entries()) {
       const user = uid(index + 2)
       await as(user, 'select public.join_workshop($1)', [`Tardío ${phase}`])
       await as(user, "select public.join_workshop('Otro nombre')")
       assert.equal((await as(user, 'select name from public.participants')).rows[0].name, `Tardío ${phase}`)
       assert.equal((await as(user, 'select phase from public.workshops')).rows[0].phase, phase)
       assert.equal((await as(user, 'select * from public.classifications')).rows.length, 0)
-      if (phase === 'waiting' || phase === 'ideas') {
+      if (phase === 'waiting' || phase === 'ideas' || phase === 'review') {
         assert.equal((await as(user, 'select * from public.ideas')).rows.length, 0)
       } else assert.equal((await as(user, 'select * from public.ideas')).rows.length, 4)
       const insert = () => as(user, 'insert into public.ideas(author_id,task) values ($1,$2) returning id', [user, 'Nueva idea'])

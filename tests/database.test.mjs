@@ -116,6 +116,7 @@ test('SQL real: fases, límites, RPC y privacidad con roles y JWT', async t => {
   })
   await t.test('clasificación: mural público solo a miembros y escritura bloqueada', async () => {
     await as(moderator, "select public.advance_phase('ideas')")
+    await as(moderator, "select public.advance_phase('review')")
     assert.equal((await as(uid(1), 'select * from public.ideas')).rows.length, 7)
     assert.equal((await as(uid(1), 'select * from public.ideas where preset')).rows.length, 3)
     assert.equal((await as(uid(101), 'select * from public.ideas')).rows.length, 0)
@@ -206,6 +207,7 @@ test('SQL real: fases, límites, RPC y privacidad con roles y JWT', async t => {
     const nextIdea = (await insertIdea(uid(1), 'Idea del nuevo encuentro')).rows[0].id
     assert.notEqual(nextIdea, firstIdea)
     await as(moderator, "select public.advance_phase('ideas')")
+    await as(moderator, "select public.advance_phase('review')")
     await as(uid(1), 'select public.classify_idea($1, array[1]::smallint[])', [nextIdea])
     await denied(uid(1), 'select public.classify_idea($1, array[1]::smallint[])', [firstIdea], /foreign key/)
     // También funciona antes de resultados y es repetible estando vacío.
@@ -215,7 +217,9 @@ test('SQL real: fases, límites, RPC y privacidad con roles y JWT', async t => {
     assert.equal((await as(moderator, 'select phase from public.workshops')).rows[0].phase, 'waiting')
   })
   await t.test('un reset antiguo con TRUNCATE no borra las ideas permanentes', async () => {
-    await assert.rejects(db.exec('begin; truncate public.classifications,public.ideas,public.participants; commit;'), /reset.sql actualizado/)
+    await assert.rejects(db.exec('begin; truncate public.classifications,public.ideas,public.participants; commit;'), /reset.sql actualizado|foreign key constraint/)
+    await db.exec('rollback')
+    await assert.rejects(db.exec('begin; truncate public.classifications,public.ideas,public.participants,ceidef_private.hidden_ideas; commit;'), /reset.sql actualizado/)
     await db.exec('rollback')
     assert.deepEqual((await db.query('select * from public.ideas order by id')).rows, initialPresets)
   })

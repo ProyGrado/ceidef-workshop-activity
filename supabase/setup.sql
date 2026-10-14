@@ -16,7 +16,7 @@ revoke all on ceidef_private.reset_context from public, anon, authenticated;
 create table public.workshops (
   id smallint primary key check (id = 1),
   title text not null default 'Laboratorio de ideas',
-  phase text not null default 'waiting' check (phase in ('waiting', 'ideas', 'classification', 'results')),
+  phase text not null default 'waiting' check (phase in ('waiting', 'ideas', 'review', 'classification', 'results')),
   updated_at timestamptz not null default now()
 );
 insert into public.workshops (id) values (1);
@@ -63,6 +63,18 @@ create table public.ideas (
 );
 create index ideas_author_idx on public.ideas(author_id);
 
+create table ceidef_private.hidden_ideas (
+  idea_id uuid primary key references public.ideas(id) on delete cascade,
+  hidden_by uuid not null,
+  hidden_at timestamptz not null default now()
+);
+alter table ceidef_private.hidden_ideas enable row level security;
+revoke all on ceidef_private.hidden_ideas from public, anon, authenticated;
+create function ceidef_private.idea_is_visible(target_idea uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select not exists (select 1 from ceidef_private.hidden_ideas h where h.idea_id = target_idea);
+$$;
+
 create table public.classifications (
   user_id uuid not null references public.participants(user_id),
   idea_id uuid not null references public.ideas(id) on delete cascade,
@@ -103,12 +115,13 @@ create policy areas_read on public.areas for select to authenticated using (true
 create policy participants_read on public.participants for select to authenticated
   using (user_id = (select auth.uid()) or (select public.is_moderator()));
 create policy ideas_read on public.ideas for select to authenticated using (
-  (not preset or (select ceidef_private.phase()) in ('classification', 'results')) and (
-    (select public.is_moderator()) or (
-      (select ceidef_private.is_participant()) and (
-        author_id = (select auth.uid()) or (select ceidef_private.phase()) in ('classification', 'results')
-      )
-    )
+  ((select public.is_moderator()) and
+    (not preset or (select ceidef_private.phase()) in ('review', 'classification', 'results')))
+  or (
+    (select ceidef_private.is_participant()) and (select ceidef_private.phase()) <> 'review'
+    and ceidef_private.idea_is_visible(id)
+    and (not preset or (select ceidef_private.phase()) in ('classification', 'results'))
+    and (author_id = (select auth.uid()) or (select ceidef_private.phase()) in ('classification', 'results'))
   )
 );
 create policy ideas_insert on public.ideas for insert to authenticated with check (
@@ -125,7 +138,7 @@ create policy ideas_delete on public.ideas for delete to authenticated
 -- Ni siquiera los moderadores pueden leer clasificaciones ajenas: el progreso
 -- y los resultados se consultan mediante RPC que devuelven solo agregados.
 create policy classifications_read on public.classifications for select to authenticated
-  using (user_id = (select auth.uid()));
+  using (user_id = (select auth.uid()) and ceidef_private.idea_is_visible(idea_id));
 create policy classifications_insert on public.classifications for insert to authenticated with check (
   user_id = (select auth.uid()) and (select ceidef_private.is_participant())
   and (select ceidef_private.phase()) = 'classification'
@@ -173,6 +186,9 @@ begin
   end if;
   select phase into current_phase from public.workshops where id = 1 for share;
   if current_phase <> 'ideas' then raise exception 'La escritura de ideas está cerrada.'; end if;
+  if not public.is_moderator() and not ceidef_private.idea_is_visible(case when TG_OP = 'DELETE' then OLD.id else NEW.id end) then
+    raise exception 'La idea ya no está disponible.';
+  end if;
   if TG_OP = 'DELETE' then owner_id := OLD.author_id; is_team := OLD.organizer;
   else owner_id := NEW.author_id; is_team := NEW.organizer; end if;
   if owner_id is distinct from auth.uid() then raise exception 'Solo podés modificar tus propias ideas.'; end if;
@@ -218,6 +234,7 @@ declare current_phase text;
 begin
   select phase into current_phase from public.workshops where id = 1 for share;
   if current_phase <> 'classification' then raise exception 'La clasificación está cerrada.'; end if;
+  if not ceidef_private.idea_is_visible(NEW.idea_id) then raise exception 'La idea ya no está disponible.'; end if;
   if NEW.user_id is distinct from auth.uid() or not ceidef_private.is_participant() then
     raise exception 'Solo podés guardar tus propias clasificaciones.';
   end if;
@@ -272,7 +289,7 @@ begin
   if not public.is_moderator() then raise exception 'Se requieren permisos de moderador.'; end if;
   select phase into current_phase from public.workshops where id = 1 for update;
   if current_phase is distinct from expected_phase then raise exception 'La fase cambió. Actualizá antes de continuar.'; end if;
-  next_phase := case current_phase when 'waiting' then 'ideas' when 'ideas' then 'classification' when 'classification' then 'results' end;
+  next_phase := case current_phase when 'waiting' then 'ideas' when 'ideas' then 'review' when 'review' then 'classification' when 'classification' then 'results' end;
   if next_phase is null then raise exception 'La actividad ya finalizó.'; end if;
   update public.workshops set phase = next_phase, updated_at = now() where id = 1;
   return next_phase;
@@ -284,8 +301,10 @@ language plpgsql stable security definer set search_path = '' as $$
 begin
   if not public.is_moderator() then raise exception 'Se requieren permisos de moderador.'; end if;
   return query select p.user_id, p.name, count(c.idea_id),
-    (select count(*) from public.ideas i where not i.preset or ceidef_private.phase() in ('classification', 'results'))
+    (select count(*) from public.ideas i where ceidef_private.idea_is_visible(i.id)
+      and (not i.preset or ceidef_private.phase() in ('review', 'classification', 'results')))
     from public.participants p left join public.classifications c on c.user_id = p.user_id
+      and ceidef_private.idea_is_visible(c.idea_id)
     group by p.user_id, p.name, p.created_at order by p.created_at;
 end;
 $$;
@@ -301,6 +320,7 @@ begin
     (select count(*) from public.classifications c3 where c3.idea_id = i.id and cardinality(c3.area_ids) = 0)
     from public.ideas i cross join public.areas a
     left join public.classifications c on c.idea_id = i.id and a.id = any(c.area_ids)
+    where public.is_moderator() or ceidef_private.idea_is_visible(i.id)
     group by i.id, a.id order by i.id, a.id;
 end;
 $$;
@@ -312,7 +332,39 @@ revoke all on all functions in schema ceidef_private from public, anon, authenti
 -- Los helpers usados por las políticas requieren USAGE/EXECUTE; el esquema no
 -- debe incluirse en los esquemas expuestos de la API de Supabase.
 grant usage on schema ceidef_private to authenticated;
-grant execute on function ceidef_private.is_participant(), ceidef_private.phase() to authenticated;
+grant execute on function ceidef_private.is_participant(), ceidef_private.phase(), ceidef_private.idea_is_visible(uuid) to authenticated;
+
+-- BEGIN IDEA VISIBILITY RPC
+create function public.get_hidden_idea_ids() returns table (idea_id uuid)
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if not public.is_moderator() then raise exception 'Se requieren permisos de moderador.'; end if;
+  return query select h.idea_id from ceidef_private.hidden_ideas h join public.ideas i on i.id = h.idea_id
+    where not i.preset or ceidef_private.phase() in ('review', 'classification', 'results') order by h.idea_id;
+end;
+$$;
+create function public.set_idea_visibility(target_idea uuid, visible boolean) returns void
+language plpgsql security definer set search_path = '' as $$
+declare current_phase text;
+begin
+  if not public.is_moderator() then raise exception 'Se requieren permisos de moderador.'; end if;
+  if visible is null then raise exception 'Indicá si la idea debe mostrarse.'; end if;
+  select phase into current_phase from public.workshops where id = 1 for update;
+  if not exists (select 1 from public.ideas i where i.id = target_idea
+    and (not i.preset or current_phase in ('review', 'classification', 'results'))) then
+    raise exception 'La idea ya no está disponible.';
+  end if;
+  if visible then delete from ceidef_private.hidden_ideas where idea_id = target_idea;
+  else insert into ceidef_private.hidden_ideas(idea_id, hidden_by) values (target_idea, auth.uid())
+    on conflict (idea_id) do nothing;
+  end if;
+  -- Invalida el mural conservado, también en Resultados, y avisa por Realtime.
+  update public.workshops set updated_at = clock_timestamp() where id = 1;
+end;
+$$;
+revoke all on function public.get_hidden_idea_ids(), public.set_idea_visibility(uuid, boolean) from public, anon, authenticated;
+grant execute on function public.get_hidden_idea_ids(), public.set_idea_visibility(uuid, boolean) to authenticated;
+-- END IDEA VISIBILITY RPC
 
 -- Publicar solamente la fase. Las ideas y votos privados NO van a Realtime.
 -- BEGIN MODERATOR RESET
@@ -332,6 +384,7 @@ begin
     values (pg_current_xact_id(), auth.uid());
   truncate table public.classifications, public.participants;
   delete from public.ideas where not preset;
+  delete from ceidef_private.hidden_ideas where idea_id is not null;
   update public.workshops set phase = 'waiting', updated_at = clock_timestamp() where id = 1;
   delete from ceidef_private.reset_context where transaction_id = pg_current_xact_id();
 exception when lock_not_available then

@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node --test tests/database.test.mjs tests/csv.test.mjs tests/pagination.test.mjs tests/migration.test.mjs tests/preset-migration.test.mjs tests/late-join.test.mjs tests/reset-rpc.test.mjs",
+    "test": "node --test tests/database.test.mjs tests/csv.test.mjs tests/pagination.test.mjs tests/migration.test.mjs tests/preset-migration.test.mjs tests/late-join.test.mjs tests/reset-rpc.test.mjs tests/visibility.test.mjs tests/review-phase.test.mjs",
     "test:e2e": "playwright test"
   },
   "dependencies": {

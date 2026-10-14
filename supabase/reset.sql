@@ -20,6 +20,12 @@ lock table public.workshops, public.participants, public.ideas, public.classific
 -- Las ideas predeterminadas permanecen intactas y quedan ocultas en Espera.
 truncate table public.classifications, public.participants;
 delete from public.ideas where not preset;
+-- Compatible con instalaciones anteriores a la gestión de visibilidad.
+do $$ begin
+  if to_regclass('ceidef_private.hidden_ideas') is not null then
+    execute 'delete from ceidef_private.hidden_ideas where idea_id is not null';
+  end if;
+end; $$;
 
 update public.workshops
 set phase = 'waiting', updated_at = now()

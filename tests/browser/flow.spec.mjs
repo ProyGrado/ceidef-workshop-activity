@@ -36,6 +36,18 @@ function fixture() {
       const endpoint = url.pathname.split('/').at(-1)
       if (url.pathname.includes('/rpc/')) {
         if (endpoint === 'is_moderator') return respond(mod)
+        if (endpoint === 'get_hidden_idea_ids') {
+          if (!mod) return failure('Se requieren permisos de moderador.')
+          return respond(paginate(state.ideas.filter(i => i.hidden && (!i.preset || ['review', 'classification', 'results'].includes(state.phase))).map(i => ({ idea_id: i.id }))))
+        }
+        if (endpoint === 'set_idea_visibility') {
+          if (!mod) return failure('Se requieren permisos de moderador.')
+          if (state.failVisibility) { state.failVisibility = false; return failure('No se pudo cambiar la visibilidad.') }
+          const idea = state.ideas.find(i => i.id === body.target_idea)
+          if (!idea) return failure('La idea ya no está disponible.')
+          idea.hidden = !body.visible; state.revision++
+          return respond(null)
+        }
         if (endpoint === 'join_workshop') {
           if (mine) return respond(mine)
           if (mod) return failure('El moderador no ocupa un lugar de participante.')
@@ -46,7 +58,7 @@ function fixture() {
         }
         if (endpoint === 'advance_phase') {
           if (!mod) return failure('Se requieren permisos de moderador.')
-          state.phase = { waiting: 'ideas', ideas: 'classification', classification: 'results' }[state.phase]
+          state.phase = { waiting: 'ideas', ideas: 'review', review: 'classification', classification: 'results' }[state.phase]
           state.revision++
           return respond(state.phase)
         }
@@ -56,25 +68,27 @@ function fixture() {
           if (state.failReset) { state.failReset = false; return failure('No se pudo reiniciar. Volvé a intentar.') }
           state.participants = []; state.choices = []
           state.ideas = state.ideas.filter(idea => idea.preset)
+          state.ideas.forEach(idea => { idea.hidden = false })
           state.phase = 'waiting'; state.revision++
           return respond(null)
         }
         if (endpoint === 'classify_idea') {
           if (!mine || state.phase !== 'classification') return failure('La clasificación está cerrada.')
+          if (state.ideas.find(i => i.id === body.target_idea)?.hidden) return failure('La idea ya no está disponible.')
           state.choices = state.choices.filter(c => c.user_id !== user.id || c.idea_id !== body.target_idea)
           state.choices.push({ user_id: user.id, idea_id: body.target_idea, area_ids: body.selected_areas })
           return respond(null)
         }
-        if (endpoint === 'get_progress') return respond(paginate(state.participants.map(p => ({ ...p, completed: state.choices.filter(c => c.user_id === p.user_id).length, total: state.ideas.filter(i => !i.preset || ['classification', 'results'].includes(state.phase)).length }))))
-        if (endpoint === 'get_results') return respond(paginate(state.ideas.flatMap(i => AREAS.map((_, n) => ({ idea_id: i.id, area_id: n + 1, votes: state.choices.filter(c => c.idea_id === i.id && c.area_ids.includes(n + 1)).length, total: state.choices.filter(c => c.idea_id === i.id).length, no_area: state.choices.filter(c => c.idea_id === i.id && c.area_ids.length === 0).length })))))
+        if (endpoint === 'get_progress') return respond(paginate(state.participants.map(p => ({ ...p, completed: state.choices.filter(c => c.user_id === p.user_id && !state.ideas.find(i => i.id === c.idea_id)?.hidden).length, total: state.ideas.filter(i => !i.hidden && (!i.preset || ['review', 'classification', 'results'].includes(state.phase))).length }))))
+        if (endpoint === 'get_results') return respond(paginate(state.ideas.filter(i => mod || !i.hidden).flatMap(i => AREAS.map((_, n) => ({ idea_id: i.id, area_id: n + 1, votes: state.choices.filter(c => c.idea_id === i.id && c.area_ids.includes(n + 1)).length, total: state.choices.filter(c => c.idea_id === i.id).length, no_area: state.choices.filter(c => c.idea_id === i.id && c.area_ids.length === 0).length })))))
       }
       const single = request.headers().accept?.includes('application/vnd.pgrst.object')
       const replyRows = rows => respond(single ? rows[0] : paginate(rows))
       if (endpoint === 'workshops') return replyRows([{ id: 1, title: 'Laboratorio de ideas', phase: state.phase, updated_at: `revision-${state.revision}` }])
       if (endpoint === 'participants') return replyRows(state.participants.filter(p => p.user_id === user?.id))
-      if (endpoint === 'classifications') return replyRows(state.choices.filter(c => c.user_id === user?.id))
+      if (endpoint === 'classifications') return replyRows(state.choices.filter(c => c.user_id === user?.id && !state.ideas.find(i => i.id === c.idea_id)?.hidden))
       if (endpoint === 'ideas') {
-        if (method === 'GET') return replyRows(state.ideas.filter(i => (!i.preset || ['classification', 'results'].includes(state.phase)) && (mod || (mine && (state.phase !== 'ideas' || i.author_id === user?.id)))))
+        if (method === 'GET') return replyRows(state.ideas.filter(i => (!i.preset || (mod ? ['review', 'classification', 'results'] : ['classification', 'results']).includes(state.phase)) && (mod || (mine && state.phase !== 'review' && !i.hidden && (state.phase !== 'ideas' || i.author_id === user?.id)))))
         if (state.failSave) { state.failSave = false; return failure('Error de conexión de prueba. Volvé a intentar.') }
         if (state.phase !== 'ideas') return failure('La escritura de ideas está cerrada.')
         if (method === 'POST') {
@@ -230,10 +244,152 @@ test('reinicio solo de moderación: popup, cancelar, error, reintentar y conserv
     await advance(mod, 'Comenzar escritura')
     await expect(mod.locator('article')).toHaveCount(0)
     await advance(mod, 'Cerrar escritura')
+  await advance(mod, 'Abrir clasificación')
     await expect(page.locator('article')).toHaveCount(3, { timeout: 10000 })
     await page.reload()
     await expect(page.locator('article')).toHaveCount(3)
     await expect(page.getByText('0 de 3 ideas clasificadas')).toBeVisible()
+  } finally { await context.close() }
+})
+
+for (const phase of ['classification', 'results']) {
+  test(`gestión discreta de ideas en ${phase}: ocultar para todos, listar y restaurar votos`, async ({ page, browser }, testInfo) => {
+    const api = fixture()
+    api.state.phase = phase
+    api.state.participants.push({ user_id: 'original', name: 'Original' })
+    api.state.ideas = [
+      { ...draftValues('Idea a retirar'), id: 'normal', author_id: 'original', organizer: false },
+      { ...draftValues('Una tarea de ejemplo'), id: 'preset', author_id: null, organizer: true, preset: true, title: 'Asistente' },
+    ]
+    api.state.choices = [{ user_id: 'original', idea_id: 'normal', area_ids: [1] }]
+    await api.attach(page.context())
+    await page.goto('/')
+    await expect(page.getByText('PENSAR · COMPARTIR · CONECTAR')).toHaveCount(0)
+    await expect(page.getByText('Ideas que conectan.')).toHaveCount(0)
+    await page.getByLabel('Tu nombre').fill('Participante')
+    await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+    await expect(page.locator('article')).toHaveCount(2)
+    await expect(page.getByText('Idea predeterminada · Equipo organizador')).toHaveCount(0)
+    await expect(page.locator('article').last()).not.toHaveClass(/note-team/)
+    if (phase === 'classification') {
+      await page.locator('article').first().getByRole('button', { name: 'Guardar sin áreas', exact: true }).click()
+      await expect(page.getByText('✓ Respuesta guardada sin áreas')).toBeVisible()
+    }
+    else {
+      await expect(page.getByText('EL MAPA DEL ENCUENTRO')).toHaveCount(0)
+      await expect(page.locator('.intro-description')).toHaveCount(0)
+    }
+    const votesBefore = structuredClone(api.state.choices)
+    const context = await browser.newContext({ viewport: testInfo.project.use.viewport })
+    try {
+      await api.attach(context)
+      const mod = await context.newPage()
+      await mod.goto('http://127.0.0.1:5199/?moderador')
+      await mod.getByLabel('Correo electrónico').fill('moderador@example.test')
+      await mod.getByLabel('Contraseña').fill('test-password-only')
+      await mod.getByRole('button', { name: 'Ingresar', exact: true }).click()
+      await expect(mod.locator('article')).toHaveCount(2)
+      await expect(mod.getByRole('button', { name: 'Ocultar', exact: true })).toHaveCount(0)
+      const openManager = async () => {
+        await mod.getByLabel('Opciones de moderación', { exact: true }).click()
+        await mod.getByRole('button', { name: 'Administrar ideas', exact: true }).click()
+      }
+      await openManager()
+      const popup = mod.getByRole('dialog', { name: 'Administrar ideas' })
+      const entry = popup.locator('li').filter({ hasText: 'Idea a retirar' })
+      api.state.failVisibility = true
+      await entry.getByRole('button', { name: 'Ocultar', exact: true }).click()
+      await expect(popup.getByRole('alert')).toContainText('No se pudo cambiar')
+      await entry.getByRole('button', { name: 'Ocultar', exact: true }).click()
+      await expect(entry).toHaveCount(0)
+      await popup.getByRole('button', { name: 'Ocultas', exact: true }).click()
+      await expect(entry).toHaveCount(1)
+      await popup.screenshot({ path: testInfo.outputPath(`gestion-${phase}.png`) })
+      await popup.getByRole('button', { name: 'Cerrar', exact: true }).click()
+      await expect(mod.locator('article')).toHaveCount(1)
+      await expect(mod.getByText('Ocultas', { exact: true })).toHaveCount(0)
+      await expect(mod.getByText('Idea a retirar', { exact: true })).toHaveCount(0)
+      await expect(page.locator('article')).toHaveCount(1, { timeout: 10000 })
+      expect(api.state.choices).toEqual(votesBefore)
+      await mod.reload()
+      await expect(mod.locator('article')).toHaveCount(1)
+      await page.reload()
+      await expect(page.locator('article')).toHaveCount(1)
+      await openManager()
+      await popup.getByRole('button', { name: 'Ocultas', exact: true }).click()
+      await entry.getByRole('button', { name: 'Mostrar', exact: true }).click()
+      await expect(entry).toHaveCount(0)
+      await popup.getByRole('button', { name: 'Cerrar', exact: true }).click()
+      await expect(page.locator('article')).toHaveCount(2, { timeout: 10000 })
+      expect(api.state.choices).toEqual(votesBefore)
+      if (phase === 'classification') await expect(page.getByText('1 de 2 ideas clasificadas')).toBeVisible()
+      else await expect(page.locator('article').first().locator('.result-total')).toContainText('1')
+    } finally { await context.close() }
+  })
+}
+
+test('revisión antes de clasificación: ocultar normales y precargadas sin exponer el mural', async ({ page, browser }, testInfo) => {
+  const api = fixture()
+  api.state.phase = 'ideas'
+  api.state.participants.push({ user_id: 'original', name: 'Original' })
+  api.state.ideas = [
+    { ...draftValues('Propuesta para revisar'), id: 'normal', author_id: 'original', organizer: false },
+    { ...draftValues('Tarea de ejemplo'), id: 'preset', author_id: null, organizer: true, preset: true, title: 'Asistente de ejemplo' },
+    { ...draftValues('Propuesta que queda'), id: 'remaining', author_id: 'original', organizer: false },
+  ]
+  await api.attach(page.context())
+  await page.goto('/')
+  await page.getByLabel('Tu nombre').fill('Participante')
+  await page.getByRole('button', { name: 'Entrar a la actividad' }).click()
+  await expect(page.getByRole('heading', { name: 'Tus post-its' })).toBeVisible()
+  const context = await browser.newContext({ viewport: testInfo.project.use.viewport })
+  try {
+    await api.attach(context)
+    const mod = await context.newPage()
+    await mod.goto('http://127.0.0.1:5199/?moderador')
+    await mod.getByLabel('Correo electrónico').fill('moderador@example.test')
+    await mod.getByLabel('Contraseña').fill('test-password-only')
+    await mod.getByRole('button', { name: 'Ingresar', exact: true }).click()
+    await expect(mod.locator('article').getByRole('button', { name: 'Ocultar', exact: true })).toHaveCount(0)
+    await advance(mod, 'Cerrar escritura')
+    expect(api.state.phase).toBe('review')
+    await expect(mod.locator('article')).toHaveCount(3)
+    await expect(mod.getByRole('button', { name: 'Abrir clasificación', exact: true })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'La clasificación comenzará en breve.' })).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('article')).toHaveCount(0)
+    await expect(page.locator('.idea-composer')).toHaveCount(0)
+    await expect(page.locator('.area-option')).toHaveCount(0)
+    await page.reload()
+    await expect(page.getByRole('heading', { name: 'La clasificación comenzará en breve.' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Ocultar', exact: true })).toHaveCount(0)
+    api.state.failVisibility = true
+    const firstCard = mod.locator('article').filter({ hasText: 'Propuesta para revisar' })
+    await firstCard.getByRole('button', { name: 'Ocultar', exact: true }).click()
+    await expect(mod.getByRole('alert')).toContainText('No se pudo cambiar')
+    await expect(mod.locator('article')).toHaveCount(3)
+    for (const text of ['Propuesta para revisar', 'Asistente de ejemplo']) {
+      const card = mod.locator('article').filter({ hasText: text })
+      await card.getByRole('button', { name: 'Ocultar', exact: true }).click()
+      await expect(card).toHaveCount(0)
+    }
+    await mod.getByLabel('Opciones de moderación', { exact: true }).click()
+    await mod.getByRole('button', { name: 'Administrar ideas', exact: true }).click()
+    const manager = mod.getByRole('dialog', { name: 'Administrar ideas' })
+    await manager.getByRole('button', { name: 'Ocultas', exact: true }).click()
+    await expect(manager.locator('li')).toHaveCount(2)
+    await manager.getByRole('button', { name: 'Cerrar', exact: true }).click()
+    await expect(mod.locator('article')).toHaveCount(1)
+    await mod.reload()
+    await expect(mod.getByRole('button', { name: 'Abrir clasificación', exact: true })).toBeVisible()
+    await mod.screenshot({ path: testInfo.outputPath('etapa-revision.png'), fullPage: true })
+    await advance(mod, 'Abrir clasificación')
+    await expect(mod.locator('article').getByRole('button', { name: 'Ocultar', exact: true })).toHaveCount(0)
+    await expect(page.locator('article')).toHaveCount(1, { timeout: 10000 })
+    await expect(page.getByText('Propuesta que queda', { exact: true })).toBeVisible()
+    await expect(page.getByText('Propuesta para revisar', { exact: true })).toHaveCount(0)
+    await expect(page.getByRole('heading', { name: 'Asistente de ejemplo', exact: true })).toHaveCount(0)
+    await page.locator('article').getByRole('button', { name: 'Guardar sin áreas', exact: true }).click()
+    await expect(page.getByText('1 de 1 ideas clasificadas')).toBeVisible()
   } finally { await context.close() }
 })
 
@@ -305,6 +461,7 @@ test('recorrido completo: dos participantes, moderación, recarga y CSV', async 
   await expect(second.getByText('Un seguimiento personalizado', { exact: true })).toHaveCount(0)
   await addIdea(mod, 'Propuesta del equipo')
   await advance(mod, 'Cerrar escritura')
+  await advance(mod, 'Abrir clasificación')
   await expect(page.locator('article')).toHaveCount(12, { timeout: 10000 })
   await expect(page.getByRole('button', { name: 'Editar' })).toHaveCount(0)
   const card = page.locator('article', { hasText: 'Un seguimiento personalizado' })
@@ -541,11 +698,13 @@ test('ideas predeterminadas: aparecen al clasificar, muestran resultados y sobre
   }
   await addIdea(page, 'Idea que sí se borra al reiniciar')
   await advance(mod, 'Cerrar escritura')
+  await advance(mod, 'Abrir clasificación')
   await expect(page.locator('article')).toHaveCount(4, { timeout: 10000 })
   for (const title of titles) await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible()
   const first = page.locator('article', { hasText: titles[0] })
   await expect(first.getByRole('button', { name: 'Editar', exact: true })).toHaveCount(0)
-  await expect(first.getByText('Idea predeterminada · Equipo organizador')).toBeVisible()
+  await expect(first.getByText('Idea predeterminada · Equipo organizador')).toHaveCount(0)
+  await expect(first).not.toHaveClass(/note-team/)
   await first.locator('.area-option').filter({ hasText: AREAS[0] }).click()
   await expect(first.locator('.area-option').filter({ hasText: AREAS[0] })).toHaveAttribute('aria-pressed', 'true')
   await page.locator('article', { hasText: titles[1] }).getByRole('button', { name: 'Guardar sin áreas', exact: true }).click()
@@ -579,6 +738,7 @@ test('ideas predeterminadas: aparecen al clasificar, muestran resultados y sobre
   await expect(page.locator('.idea-composer')).toBeVisible({ timeout: 10000 })
   await expect(page.locator('article')).toHaveCount(0)
   await advance(mod, 'Cerrar escritura')
+  await advance(mod, 'Abrir clasificación')
   await expect(page.locator('article')).toHaveCount(3, { timeout: 10000 })
   for (const title of titles) await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible()
   await expect(page.getByText('0 de 3 ideas clasificadas', { exact: true })).toBeVisible()

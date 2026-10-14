@@ -1,7 +1,7 @@
-export const PHASES = ['waiting', 'ideas', 'classification', 'results'] as const
+export const PHASES = ['waiting', 'ideas', 'review', 'classification', 'results'] as const
 export type Phase = typeof PHASES[number]
 export const PHASE_NAMES: Record<Phase, string> = {
-  waiting: 'Espera', ideas: 'Ideas', classification: 'Clasificación', results: 'Resultados',
+  waiting: 'Espera', ideas: 'Ideas', review: 'Revisión', classification: 'Clasificación', results: 'Resultados',
 }
 export const AREAS = [
   'Individualización de tratamientos',
@@ -41,6 +41,7 @@ export interface Progress extends Participant { completed: number; total: number
 export interface Snapshot {
   workshop: Workshop; participant: Participant | null; moderator: boolean;
   ideas: Idea[]; choices: Choice[]; results: Result[]; progress: Progress[];
+  hiddenIdeaIds: string[];
 }
 export function indexResults(results: Result[]): Map<string, Result[]> {
   const grouped = new Map<string, Result[]>()
@@ -59,12 +60,13 @@ export function csvCell(value: unknown): string {
   return `"${safe.replaceAll('"', '""')}"`
 }
 export function buildCsv(snapshot: Snapshot, withResults: boolean): string {
-  const header = ['ID', 'Título', ...IDEA_FIELDS.map(field => field.label), 'Autor', ...(withResults ? [...AREAS, 'Sin áreas', 'Total de respuestas'] : [])]
+  const header = ['ID', 'Título', ...IDEA_FIELDS.map(field => field.label), 'Autor', 'Visibilidad', ...(withResults ? [...AREAS, 'Sin áreas', 'Total de respuestas'] : [])]
   const names = new Map(snapshot.progress.map(p => [p.user_id, p.name]))
   const results = indexResults(snapshot.results)
   const rows = snapshot.ideas.map(idea => {
     const counts = results.get(idea.id) ?? []
     return [idea.id, idea.title, ...IDEA_FIELDS.map(({ key }) => idea[key]), idea.organizer ? 'Equipo organizador' : (idea.author_id && names.get(idea.author_id)) || 'Participante',
+      snapshot.hiddenIdeaIds?.includes(idea.id) ? 'Oculta' : 'Visible',
       ...(withResults ? [...AREAS.map((_, index) => counts.find(r => r.area_id === index + 1)?.votes ?? 0), counts[0]?.no_area ?? 0, counts[0]?.total ?? 0] : []),
     ]
   })
